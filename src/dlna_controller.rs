@@ -118,101 +118,185 @@ fn log_upnp_action(service: &rupnp::Service, base_url: &Uri, action: &str, args_
 /// To make behavior explicit (and loggable), we send the SOAP request ourselves to:
 /// `{scheme}://{host}:{port}/{control_path}`.
 async fn avtransport_action_compat(
+    service: &rupnp::Service,
     base_url: &Uri,
     action: &str,
     args_xml: &str,
 ) -> Result<HashMap<String, String>, rupnp::Error> {
+    // 首先尝试使用 rupnp 原生的 action 方法（适用于Windows Media Player等标准设备）
+    match service.action(base_url, action, args_xml).await {
+        Ok(response) => {
+            log::info!("UPnP Action (native) succeeded");
+            log::debug!("UPnP Action (native) response: {:?}", response);
+            return Ok(response);
+        }
+        Err(e) => {
+            log::warn!("UPnP Action (native) failed: {}, trying compatibility mode", e);
+        }
+    }
+
+    // 原生方法失败，尝试兼容性模式
+
+    // 从 debug 输出中我们可以看到 service 的结构
+    // 我们可以通过 Debug 表示式提取 control_endpoint 信息
+    let service_debug = format!("{:?}", service);
+    log::debug!("Service Debug info: {}", service_debug);
+
     let host = base_url
         .host()
         .ok_or(rupnp::Error::ParseError("base_url缺少host"))?
         .to_string();
-    let port = base_url
-        .port_u16()
-        .ok_or(rupnp::Error::ParseError("base_url缺少port"))?;
     let scheme = base_url
         .scheme_str()
         .ok_or(rupnp::Error::ParseError("base_url缺少scheme"))?;
+    let port = base_url
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
-    // Device's description.xml says controlURL is `_urn:...` (no leading slash)
-    // but B站抓包显示 path 是 `/_urn:...`.
-    let control_path = "/_urn:schemas-upnp-org:service:AVTransport_control";
-    let final_url = format!("{}://{}:{}{}", scheme, host, port, control_path);
+    // 候选控制路径：优先使用 debug 中的 control_endpoint，并补充常见路径
+    let mut possible_paths: Vec<String> = Vec::new();
 
-    let soap_action_header = format!(
-        "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
-        action
-    );
-    let body = build_soap_envelope(action, args_xml);
-
-    log::info!(
-        "UPnP Action (compat) -> url={} SOAPAction={}",
-        final_url,
-        soap_action_header
-    );
-    log::debug!("UPnP Action (compat) body => {}", body);
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "SOAPAction",
-        HeaderValue::from_str(&soap_action_header)
-            .map_err(|_| rupnp::Error::ParseError("SOAPAction header非法"))?,
-    );
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/xml; charset=\"utf-8\""),
-    );
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .map_err(|_| rupnp::Error::ParseError("创建reqwest client失败"))?;
-
-    let resp = client
-        .post(&final_url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| rupnp::Error::ParseError(Box::leak(format!("发送SOAP请求失败: {}", e).into_boxed_str())))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| rupnp::Error::ParseError(Box::leak(format!("读取SOAP响应失败: {}", e).into_boxed_str())))?;
-
-    if status.as_u16() != 200 {
-        // Non-200 treated as error. Include status + body for diagnosis.
-        log::warn!("UPnP Action (compat) status={} body={}", status, text);
-        return Err(rupnp::Error::ParseError(Box::leak(
-            format!("AVTransport返回HTTP状态码{}", status.as_u16()).into_boxed_str(),
-        )));
+    if let Some(path) = extract_control_endpoint_from_debug(&service_debug) {
+        possible_paths.push(normalize_control_path(&path));
     }
 
-    // Parse a few common fields from SOAP response so callers like GetPositionInfo work.
-    // This keeps dependencies minimal; if you need robust parsing later, we can introduce
-    // an XML crate and parse properly.
-    log::debug!("UPnP Action (compat) status=200 body={}", text);
-
-    let mut out = HashMap::new();
-
-    // AVTransport:GetPositionInfo common fields
-    for k in [
-        "Track",
-        "TrackDuration",
-        "TrackMetaData",
-        "TrackURI",
-        "RelTime",
-        "AbsTime",
-        "RelCount",
-        "AbsCount",
-    ] {
-        if let Some(v) = extract_xml_tag_value(&text, k) {
-            out.insert(k.to_string(), v);
+    // 尝试从 debug 中解析出真实的控制路径（常见于 Windows UPnP Host）
+    if let Some(start) = service_debug.find("/upnphost/udhisapi.dll?control=") {
+        if let Some(end) = service_debug[start..].find(", event_sub_endpoint") {
+            let real_path = &service_debug[start..start + end];
+            possible_paths.push(normalize_control_path(real_path));
         }
     }
 
-    Ok(out)
+    // 设备特定回退路径（不再使用硬编码 UUID）
+    if service_debug.contains("Myou Media Renderer") {
+        possible_paths.push("/_urn:schemas-upnp-org:service:AVTransport_control".to_string());
+    }
+
+    // 通用回退路径
+    possible_paths.extend(
+        [
+            "_urn:schemas-upnp-org:service:AVTransport_control",
+            "AVTransport/control",
+            "upnp/control/AVTransport",
+            "control/AVTransport",
+        ]
+        .into_iter()
+        .map(|p| normalize_control_path(p)),
+    );
+
+    // 尝试匹配可能的路径模式
+    for path in possible_paths {
+        let final_url = if path.starts_with("http://") || path.starts_with("https://") {
+            path
+        } else {
+            format!("{}://{}:{}{}", scheme, host, port, path)
+        };
+
+        let soap_action_header = format!(
+            "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
+            action
+        );
+        let body = build_soap_envelope(action, args_xml);
+
+        log::info!(
+            "UPnP Action (compat) -> url={} SOAPAction={}",
+            final_url,
+            soap_action_header
+        );
+        log::debug!("UPnP Action (compat) body => {}", body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "SOAPAction",
+            HeaderValue::from_str(&soap_action_header)
+                .map_err(|_| rupnp::Error::ParseError("SOAPAction header非法"))?,
+        );
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/xml; charset=\"utf-8\""),
+        );
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|_| rupnp::Error::ParseError("创建reqwest client失败"))?;
+
+        match client.post(&final_url).headers(headers).body(body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.map_err(|e| {
+                    rupnp::Error::ParseError(Box::leak(
+                        format!("读取SOAP响应失败: {}", e).into_boxed_str(),
+                    ))
+                })?;
+
+                if status.as_u16() == 200 {
+                    log::info!("UPnP Action (compat) succeeded with path: {}", final_url);
+                    log::debug!("UPnP Action (compat) status=200 body={}", text);
+
+                    let mut out = HashMap::new();
+                    for k in [
+                        "Track",
+                        "TrackDuration",
+                        "TrackMetaData",
+                        "TrackURI",
+                        "RelTime",
+                        "AbsTime",
+                        "RelCount",
+                        "AbsCount",
+                    ] {
+                        if let Some(v) = extract_xml_tag_value(&text, k) {
+                            out.insert(k.to_string(), v);
+                        }
+                    }
+
+                    return Ok(out);
+                } else {
+                    log::warn!(
+                        "UPnP Action (compat) failed with path {}: status={} body={}",
+                        final_url,
+                        status,
+                        text
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("UPnP Action (compat) failed with path {}: {}", final_url, e);
+            }
+        }
+    }
+
+    // 所有尝试都失败
+    Err(rupnp::Error::ParseError(Box::leak(
+        "所有AVTransport操作尝试都失败".to_string().into_boxed_str(),
+    )))
+}
+
+fn normalize_control_path(path: &str) -> String {
+    let p = path.trim();
+    if p.starts_with("http://") || p.starts_with("https://") {
+        return p.to_string();
+    }
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{}", p)
+    }
+}
+
+fn extract_control_endpoint_from_debug(service_debug: &str) -> Option<String> {
+    if let Some(start) = service_debug.find("control_endpoint: ") {
+        let start = start + "control_endpoint: ".len();
+        if let Some(end) = service_debug[start..].find(", event_sub_endpoint") {
+            let path = service_debug[start..start + end].trim();
+            Some(path.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 // AVTransport服务URN
@@ -334,7 +418,6 @@ impl DlnaController {
 
         // 构建完整的媒体URL
         let media_url = format!("http://{}:{}/{}", server_ip, server_port, current_uri);
-        // let media_url = "https://cn-jsnt-ct-01-06.bilivideo.com/upgcxcode/95/66/65166695/65166695-1-208.mp4?e=ig8euxZM2rNcNbN3hwdVhwdlhb4VhwdVhoNvNC8BqJIzNbfq9rVEuxTEnE8L5F6VnEsSTx0vkX8fqJeYTj_lta53NCM=&platform=html5&oi=1696788563&trid=0000552b5f27ec06482cbd0f902c89beadeT&mid=483794508&nbs=1&os=bcache&uipk=5&deadline=1768072065&gen=playurlv3&og=hw&upsig=40d24fb953240187eb8a621ba81a3085&uparams=e,platform,oi,trid,mid,nbs,os,uipk,deadline,gen,og&cdnid=4284&bvc=vod&nettype=0&bw=2247418&agrr=0&buvid=&build=0&dl=0&f=T_0_0&mobi_app=&orderid=0,1".to_string();
 
         log::info!("设置媒体URI: {}", media_url);
         log::debug!("元数据(传入): {}", current_uri_metadata);
@@ -347,7 +430,7 @@ impl DlnaController {
             current_uri_metadata.to_string()
         };
 
-        // 准备SOAP请求参数
+        // 准备SOAP请求参数 - 简化参数以提高兼容性
         let action = "SetAVTransportURI";
         let args_str = format!(
             "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData><SourceId></SourceId><ExtendData></ExtendData>",
@@ -358,8 +441,7 @@ impl DlnaController {
         // 发送SOAP请求 - 统一使用设备描述文档URL(location)作为base url
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, &args_str);
-    // Workaround for devices whose controlURL lacks a leading slash.
-    let response = avtransport_action_compat(&base_url, action, &args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
 
         log::debug!("SetAVTransportURI响应: {:?}", response);
 
@@ -388,14 +470,14 @@ impl DlnaController {
         };
 
         let args_str = format!(
-            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{}</NextURIMetaData>",
+            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{}</NextURIMetaData><SourceId></SourceId><ExtendData></ExtendData>",
             xml_escape(&media_url),
             metadata
         );
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, &args_str);
-    let response = avtransport_action_compat(&base_url, action, &args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
 
         log::debug!("SetNextAVTransportURI响应: {:?}", response);
 
@@ -414,7 +496,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(&base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
         log::debug!("Play响应: {:?}", response);
 
         Ok(())
@@ -432,7 +514,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(&base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
         log::debug!("Pause响应: {:?}", response);
 
         Ok(())
@@ -450,7 +532,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(&base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
         log::debug!("Stop响应: {:?}", response);
 
         Ok(())
@@ -467,7 +549,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(&base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
         log::debug!("Next响应: {:?}", response);
 
         Ok(())
@@ -484,7 +566,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(&base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
         log::debug!("传输信息: {:?}", response);
 
         Ok(())
@@ -504,7 +586,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(&base_url, action, args_str).await?;
+    let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
 
         log::debug!("GetPositionInfo parsed => {:?}", response);
 
