@@ -55,11 +55,13 @@ cargo build --release
 
 ### 运行
 
-直接运行：
+电脑端可直接运行：
 
 ```bash
 cargo run
 ```
+
+手机端可用termux运行编译好的可执行文件,见[README.md](../README.md#手机上怎么用)
 
 程序会提示：
 
@@ -94,9 +96,9 @@ RUST_LOG=info,ktv_casting=debug cargo run
 ## (重要!)连接DLNA设备
 
 以ch**k为例子，需要先扫码后，包房的机器才能被DLNA协议发现
-1. 在包房的机器上选择 发现-手机投屏，显示出投屏二维码(**注意不是点歌二维码**)
+1. 在包房的平板上选择 发现-手机投屏，显示出投屏二维码(**注意不是点歌二维码**)
 2. 连接设备(取决于你在哪里运行ktv-casting，是手机还是电脑)
-- 手机：用手机微信扫码连接投屏，登录-同意用户协议-连接设备，看到成功的提示即可。此时打开b站或 BubbleUPNP等客户端，应该能发现该设备。
+- 手机：用手机微信扫码连接投屏，登录-同意用户协议-连接设备，看到成功的提示即可。此时打开b站或 BubbleUPNP等客户端测试，设备列表中会出现包房的机器名称。
 - 电脑: 用手机浏览器扫码得到二维码对应的链接，在**电脑版微信**中打开链接(注意选择用微信内部浏览器，**不能使用系统浏览器**)，之后操作同手机端。MacOS的微信成功，但是Windows版有时会有bug。如果弹出允许访问本地网络的设备，选择允许即可。
 
 ## (重要!)辅助工具安装与抓包调试
@@ -110,16 +112,15 @@ RUST_LOG=info,ktv_casting=debug cargo run
 
 基本步骤：
 1. 安装 [PCAPdroid](https://play.google.com/store/apps/details?id=com.emanuelef.remote_capture)
-2. 启动捕获（会创建本地 VPN），选择
+2. 启动捕获（会创建本地 VPN），选择导出到文件
 3. 在bilibili等客户端连接，执行投屏操作
-4. 导出 .pcap文件，在电脑端 Wireshark 打开
+4. 结束捕获，导出 .pcap文件，在电脑端 Wireshark 打开
 
 ### 电脑端：Wireshark
-#### 安装
 
-[Wireshark官网下载安装包](https://www.wireshark.org/download.html)
+安装[Wireshark](https://www.wireshark.org/download.html)
 
-MacOS安装时如果提示安装抓包权限组件（ChmodBPF），建议按提示完成，否则可能无法捕获某些接口流量。
+> MacOS安装时如果提示安装抓包权限组件（ChmodBPF），建议按提示完成，否则可能无法捕获某些接口流量。
 
 ### (重要!)常用 Display Filter和操作技巧
 
@@ -153,13 +154,14 @@ MacOS安装时如果提示安装抓包权限组件（ChmodBPF），建议按提�
 4. 观察 DLNA 设备是否来拉取媒体：是否访问了 `http://<你的IP>:8080/...`
 
 
-### 其他辅助工具
+### 其他辅助工具(可选)
 
-BubbleUPnP（Android）：可以测试投屏到不同 DLNA 设备，确认设备是否支持 AVTransport 播放视频/音频。[BubbleUPnP 官网](https://bubblesoftapps.com/bubbleupnp/)
+[BubbleUPnP](https://bubblesoftapps.com/bubbleupnp/)（Android）：可以测试投屏到不同 DLNA 设备，确认设备是否支持 AVTransport 播放视频/音频。
 
 - 投视频需要下载[VLC](https://www.videolan.org/vlc/index.zh.html)等播放器配合使用
 - 在KTV使用DLNA工具可以参考[这篇帖子](https://www.xiaohongshu.com/discovery/item/68a01b0e000000001d01c489?source=webshare&xhsshare=pc_web&xsec_token=ABRib4kFPexc3iGS37nK9H-MDIYe91LBEGmU1hKU-oShk=&xsec_source=pc_share)
 
+[扫码投屏的参考资料](https://dolphinstar.cn/)
 
 ## DLNA / UPnP 协议速览（结合本项目）
 
