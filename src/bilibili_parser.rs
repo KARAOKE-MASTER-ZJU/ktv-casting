@@ -1,6 +1,5 @@
 use reqwest::Client;
 use serde_json::Value;
-use log::warn;
 
 /// 获取BiliBili视频直链
 ///
@@ -12,9 +11,7 @@ use log::warn;
 /// * `Result<String, String>` - 返回直链URL或错误信息
 pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<String, String> {
     let client = Client::new();
-    let mut page = page.unwrap_or(0);
-
-
+    let page = page.unwrap_or(0);
 
     // 第一步：获取CID
     let cid = get_video_cid(&client, bv_id, page).await?;

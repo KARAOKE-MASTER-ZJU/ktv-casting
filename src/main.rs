@@ -1,7 +1,6 @@
 use crate::dlna_controller::DlnaController;
 use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, anyhow, bail};
-use env_logger;
 use local_ip_address::local_ip;
 use log::{error, info, warn};
 use playlist_manager::PlaylistManager;
@@ -33,7 +32,7 @@ async fn main() -> Result<()> {
     io::stdin().read_line(&mut input).expect("无法读取输入");
     let url_str = input.trim();
     // ② 使用 url crate 解析并提取 base URL 与 room_id
-    let parsed_url = Url::parse(&url_str).with_context(|| "无法解析 URL")?;
+    let parsed_url = Url::parse(url_str).with_context(|| "无法解析 URL")?;
 
     let base_url = format!(
         "{}://{}",
@@ -104,26 +103,26 @@ async fn main() -> Result<()> {
         let controller = controller.clone();
         let device = device.clone();
         Box::pin(async move {
-
-            loop{
+            loop {
                 match controller.stop(&device).await {
                     Ok(_) => {
                         info!("成功停止播放");
                         break;
-                    },
+                    }
                     Err(e) => {
                         let error_msg = format!("{}", e);
                         let error_code: Option<u32> = error_msg
                             .split(|c: char| !c.is_numeric())
                             .find(|s| s.len() == 3)
                             .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code {
-                            if code / 100 == 2 {
-                                // 2xx错误码视为成功
-                                info!("停止播放返回错误码{}，视为成功", code);
-                                break;
-                            }
+                        if let Some(code) = error_code
+                            && code / 100 == 2
+                        {
+                            // 2xx错误码视为成功
+                            info!("停止播放返回错误码{}，视为成功", code);
+                            break;
                         }
+
                         warn!("停止播放失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
@@ -138,20 +137,21 @@ async fn main() -> Result<()> {
                     Ok(_) => {
                         info!("成功设置AVTransport URI为 {}", url);
                         break;
-                    },
+                    }
                     Err(e) => {
                         let error_msg = format!("{}", e);
                         let error_code: Option<u32> = error_msg
                             .split(|c: char| !c.is_numeric())
                             .find(|s| s.len() == 3)
                             .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code {
-                            if code / 100 == 2 {
-                                // 2xx错误码视为成功
-                                info!("设置AVTransport URI返回错误码{}，视为成功", code);
-                                break
-                            }
+                        if let Some(code) = error_code
+                            && code / 100 == 2
+                        {
+                            // 2xx错误码视为成功
+                            info!("设置AVTransport URI返回错误码{}，视为成功", code);
+                            break;
                         }
+
                         warn!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
@@ -212,20 +212,21 @@ async fn main() -> Result<()> {
                     Ok(_) => {
                         info!("成功开始播放");
                         break;
-                    },
+                    }
                     Err(e) => {
                         let error_msg = format!("{}", e);
                         let error_code: Option<u32> = error_msg
                             .split(|c: char| !c.is_numeric())
                             .find(|s| s.len() == 3)
                             .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code {
-                            if code / 100 == 2 {
-                                // 2xx错误码视为成功
-                                info!("播放返回错误码{}，视为成功", code);
-                                break;
-                            }
+                        if let Some(code) = error_code
+                            && code / 100 == 2
+                        {
+                            // 2xx错误码视为成功
+                            info!("播放返回错误码{}，视为成功", code);
+                            break;
                         }
+
                         warn!("play失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
@@ -243,7 +244,6 @@ async fn main() -> Result<()> {
             interval.tick().await;
             // 重试get_secs
             loop {
-
                 match controller.get_secs(&device_cloned).await {
                     Ok(result) => {
                         (remaining_secs, total_secs) = result;
@@ -259,13 +259,14 @@ async fn main() -> Result<()> {
                             .split(|c: char| !c.is_numeric())
                             .find(|s| s.len() == 3)
                             .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code {
-                            if code / 100 == 2 {
-                                // 2xx错误码视为成功
-                                info!("获取进度返回错误码{}，视为成功", code);
-                                break;
-                            }
+                        if let Some(code) = error_code
+                            && code / 100 == 2
+                        {
+                            // 2xx错误码视为成功
+                            info!("获取进度返回错误码{}，视为成功", code);
+                            break;
                         }
+
                         warn!("get_secs失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
@@ -281,7 +282,7 @@ async fn main() -> Result<()> {
                     match playlist_manager.next_song().await {
                         Ok(_) => break,
                         Err(e) => {
-                            let error_msg = format!("{}", e);
+                            let error_msg = e.to_string();
                             error!("next_song失败: {}，500ms后重试", error_msg);
                             sleep(Duration::from_millis(500)).await;
                         }

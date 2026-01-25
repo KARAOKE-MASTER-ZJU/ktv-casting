@@ -1,28 +1,39 @@
 use chrono::{NaiveTime, Timelike};
 use futures::future::try_join_all;
 use futures::stream::StreamExt;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
 fn extract_xml_tag_value(xml: &str, tag: &str) -> Option<String> {
-    // Best-effort extraction for simple SOAP responses.
-    // Works for patterns like: <RelTime>00:00:12</RelTime>
-    // (No full XML parsing; enough for common DLNA renderers.)
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].trim().to_string())
+    // 解析XML标签值，支持带命名空间属性的标签
+    let start_pattern = format!("<{}", tag);
+    let end_pattern = format!("</{}>", tag);
+
+    // 找到开始标签
+    if let Some(start_idx) = xml.find(&start_pattern) {
+        // 找到开始标签的结束位置 >
+        if let Some(tag_end_idx) = xml[start_idx..].find('>') {
+            let value_start = start_idx + tag_end_idx + 1;
+
+            // 找到对应的结束标签
+            if let Some(value_end) = xml[value_start..].find(&end_pattern) {
+                let value = &xml[value_start..value_start + value_end];
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn is_unknown_time(s: &str) -> bool {
     let t = s.trim();
-    t.is_empty() || t == "00:00:00" || t.eq_ignore_ascii_case("NOT_IMPLEMENTED")
+    t.is_empty() || t == "00:00:00" || t == "0:00:00" || t.eq_ignore_ascii_case("NOT_IMPLEMENTED")
 }
 
 fn xml_escape(s: &str) -> String {
@@ -47,14 +58,14 @@ fn build_didl_lite_metadata(title: &str, media_url: &str, protocol_info: Option<
 
     let didl = format!(
         r#"<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">
-<item id=\"0\" parentID=\"-1\" restricted=\"1\">
-<dc:title>{}</dc:title>
-<upnp:storageMedium>UNKNOWN</upnp:storageMedium>
-<upnp:writeStatus>UNKNOWN</upnp:writeStatus>
-<res protocolInfo=\"{}\">{}</res>
-<upnp:class>object.item.videoItem</upnp:class>
-</item>
-</DIDL-Lite>"#,
+        <item id=\"0\" parentID=\"-1\" restricted=\"1\">
+        <dc:title>{}</dc:title>
+        <upnp:storageMedium>UNKNOWN</upnp:storageMedium>
+        <upnp:writeStatus>UNKNOWN</upnp:writeStatus>
+        <res protocolInfo=\"{}\">{}</res>
+        <upnp:class>object.item.videoItem</upnp:class>
+        </item>
+        </DIDL-Lite>"#,
         xml_escape(title),
         protocol,
         res_url
@@ -69,7 +80,7 @@ fn build_soap_envelope(action: &str, args_xml: &str) -> String {
     // Note: `rupnp` will build its own envelope too, but we log a best-effort equivalent
     // so you can diff with a packet capture.
     format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Body>
         <u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">{args}</u:{action}>
@@ -93,10 +104,7 @@ fn log_upnp_action(service: &rupnp::Service, base_url: &Uri, action: &str, args_
     // the serviceId/type to help confirm we matched the expected service.
     //
     // If you still see 204, compare this log with your抓包，重点确认：Host/port/path。
-    let soap_action_header = format!(
-        "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
-        action
-    );
+    let soap_action_header = format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
 
     // Logged body is a best-effort “wire-like” payload for diffing.
     let envelope = build_soap_envelope(action, args_xml);
@@ -131,7 +139,10 @@ async fn avtransport_action_compat(
             return Ok(response);
         }
         Err(e) => {
-            log::warn!("UPnP Action (native) failed: {}, trying compatibility mode", e);
+            log::warn!(
+                "UPnP Action (native) failed: {}, trying compatibility mode",
+                e
+            );
         }
     }
 
@@ -161,16 +172,11 @@ async fn avtransport_action_compat(
     }
 
     // 尝试从 debug 中解析出真实的控制路径（常见于 Windows UPnP Host）
-    if let Some(start) = service_debug.find("/upnphost/udhisapi.dll?control=") {
-        if let Some(end) = service_debug[start..].find(", event_sub_endpoint") {
-            let real_path = &service_debug[start..start + end];
-            possible_paths.push(normalize_control_path(real_path));
-        }
-    }
-
-    // 设备特定回退路径（不再使用硬编码 UUID）
-    if service_debug.contains("Myou Media Renderer") {
-        possible_paths.push("/_urn:schemas-upnp-org:service:AVTransport_control".to_string());
+    if let Some(start) = service_debug.find("/upnphost/udhisapi.dll?control=")
+        && let Some(end) = service_debug[start..].find(", event_sub_endpoint")
+    {
+        let real_path = &service_debug[start..start + end];
+        possible_paths.push(normalize_control_path(real_path));
     }
 
     // 通用回退路径
@@ -182,7 +188,7 @@ async fn avtransport_action_compat(
             "control/AVTransport",
         ]
         .into_iter()
-        .map(|p| normalize_control_path(p)),
+        .map(normalize_control_path), // 规范化路径,增加/
     );
 
     // 尝试匹配可能的路径模式
@@ -193,10 +199,8 @@ async fn avtransport_action_compat(
             format!("{}://{}:{}{}", scheme, host, port, path)
         };
 
-        let soap_action_header = format!(
-            "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
-            action
-        );
+        let soap_action_header =
+            format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
         let body = build_soap_envelope(action, args_xml);
 
         log::info!(
@@ -222,7 +226,13 @@ async fn avtransport_action_compat(
             .build()
             .map_err(|_| rupnp::Error::ParseError("创建reqwest client失败"))?;
 
-        match client.post(&final_url).headers(headers).body(body).send().await {
+        match client
+            .post(&final_url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.text().await.map_err(|e| {
@@ -247,10 +257,12 @@ async fn avtransport_action_compat(
                         "AbsCount",
                     ] {
                         if let Some(v) = extract_xml_tag_value(&text, k) {
+                            log::debug!("提取到字段 '{}' 的值: '{}'", k, v);
                             out.insert(k.to_string(), v);
                         }
                     }
 
+                    log::debug!("解析后的响应字段: {:?}", out);
                     return Ok(out);
                 } else {
                     log::warn!(
@@ -430,10 +442,10 @@ impl DlnaController {
             current_uri_metadata.to_string()
         };
 
-        // 准备SOAP请求参数 - 简化参数以提高兼容性
+        // 准备SOAP请求参数 - 只使用标准参数以提高兼容性
         let action = "SetAVTransportURI";
         let args_str = format!(
-            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData><SourceId></SourceId><ExtendData></ExtendData>",
+            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
             xml_escape(&media_url),
             metadata
         );
@@ -470,7 +482,7 @@ impl DlnaController {
         };
 
         let args_str = format!(
-            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{}</NextURIMetaData><SourceId></SourceId><ExtendData></ExtendData>",
+            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{}</NextURIMetaData>",
             xml_escape(&media_url),
             metadata
         );
@@ -586,17 +598,13 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-    let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
 
-        log::debug!("GetPositionInfo parsed => {:?}", response);
+        // 获取响应
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
 
-        // 解析响应
-        let mut result = HashMap::new();
-        for (key, value) in response {
-            result.insert(key, value);
-        }
+        log::debug!("GetPositionInfo响应: {:?}", response);
 
-        Ok(result)
+        Ok(response)
     }
 
     // 获取当前播放位置（秒）
@@ -616,15 +624,48 @@ impl DlnaController {
             duration
         );
 
+        // 解析时间字符串，支持格式如 "0:00:01" 和 "00:00:01"
+        fn parse_time_str(time_str: &str) -> Result<NaiveTime, rupnp::Error> {
+            let trimmed = time_str.trim();
+
+            // 尝试多种时间格式
+            let formats = ["%H:%M:%S", "%M:%S", "%S"];
+
+            for fmt in &formats {
+                if let Ok(time) = NaiveTime::parse_from_str(trimmed, fmt) {
+                    log::debug!("成功解析时间 '{}' 格式: {}", trimmed, fmt);
+                    return Ok(time);
+                }
+            }
+
+            // 处理格式如 "0:00:01"（单个小时位）的情况
+            if trimmed.contains(':') {
+                let parts: Vec<&str> = trimmed.split(':').collect();
+                if parts.len() == 3 {
+                    // 确保每个部分都有正确的位数
+                    let formatted = format!(
+                        "{:02}:{:02}:{:02}",
+                        parts[0].parse::<u32>().unwrap_or(0),
+                        parts[1].parse::<u32>().unwrap_or(0),
+                        parts[2].parse::<u32>().unwrap_or(0)
+                    );
+                    log::debug!("格式化时间 '{}' 为 '{}'", trimmed, formatted);
+                    if let Ok(time) = NaiveTime::parse_from_str(&formatted, "%H:%M:%S") {
+                        return Ok(time);
+                    }
+                }
+            }
+
+            Err(rupnp::Error::ParseError("无法解析时间字符串"))
+        }
+
         // Some renderers return NOT_IMPLEMENTED / 00:00:00; treat as unknown.
         if is_unknown_time(rel_time) || is_unknown_time(duration) {
             return Ok((0, 0));
         }
 
-        let track_duration = NaiveTime::parse_from_str(duration, "%H:%M:%S")
-            .map_err(|_| rupnp::Error::ParseError("无法解析TrackDuration"))?;
-        let current_time = NaiveTime::parse_from_str(rel_time, "%H:%M:%S")
-            .map_err(|_| rupnp::Error::ParseError("无法解析RelTime"))?;
+        let track_duration = parse_time_str(duration)?;
+        let current_time = parse_time_str(rel_time)?;
 
         let remaining_time = track_duration - current_time;
 
@@ -664,19 +705,21 @@ impl DlnaController {
         );
         log::debug!(
             "UPnP Action body (approx) => {}",
-            format!(
-                r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<s:Envelope s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">
-  <s:Body>
-    <u:{action} xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">{args}</u:{action}>
-  </s:Body>
-</s:Envelope>"#,
+            format_args!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+                <s:Body>
+                    <u:{action} xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">{args}</u:{action}>
+                </s:Body>
+                </s:Envelope>"#,
                 action = action,
                 args = args_str
             )
         );
 
-        let response = rendering_control.action(&base_url, action, &args_str).await?;
+        let response = rendering_control
+            .action(&base_url, action, &args_str)
+            .await?;
         log::debug!("SetVolume响应: {:?}", response);
 
         Ok(())
@@ -707,19 +750,21 @@ impl DlnaController {
         );
         log::debug!(
             "UPnP Action body (approx) => {}",
-            format!(
-                r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<s:Envelope s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">
-  <s:Body>
-    <u:{action} xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">{args}</u:{action}>
-  </s:Body>
-</s:Envelope>"#,
+            format_args!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+                <s:Body>
+                    <u:{action} xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">{args}</u:{action}>
+                </s:Body>
+                </s:Envelope>"#,
                 action = action,
                 args = args_str
             )
         );
 
-        let response = rendering_control.action(&base_url, action, &args_str).await?;
+        let response = rendering_control
+            .action(&base_url, action, args_str)
+            .await?;
 
         // 解析音量值
         let default_volume = "0".to_string();

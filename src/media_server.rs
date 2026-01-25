@@ -40,7 +40,7 @@ pub async fn proxy_handler(
 
     info!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
 
-    let target_url = get_bilibili_direct_link(&bv_id, page)
+    let target_url = get_bilibili_direct_link(bv_id, page)
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
@@ -127,7 +127,7 @@ pub async fn proxy_handler(
 
     let body_stream = response
         .bytes_stream()
-        .map(|item| item.map_err(|e| std::io::Error::other(e)));
+        .map(|item| item.map_err(std::io::Error::other));
 
     Ok(client_resp.streaming(body_stream))
 }
