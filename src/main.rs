@@ -4,12 +4,14 @@ use anyhow::{Context, Result, bail};
 use local_ip_address::local_ip;
 use log::{error, info, warn, debug, Log, Metadata, Record, LevelFilter};
 use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget,ProgressState};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind};
+use crossterm::terminal;
 use std::fmt::Write;
 use playlist_manager::PlaylistManager;
 use reqwest::Client;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use url::{Position, Url};
@@ -57,6 +59,16 @@ async fn main() -> Result<()> {
         }
     }
     let pb = ProgressBar::new(0);
+    pb.set_draw_target(ProgressDrawTarget::hidden());
+    let env_log = env_logger::Builder::from_default_env().build();
+     // 注册logger box接管日志
+    let custom_logger = ProgressLogger {
+        inner: Box::new(env_log),
+        pb: pb.clone(),
+    };
+    log::set_boxed_logger(Box::new(custom_logger))
+        .map(|()| log::set_max_level(LevelFilter::Info))
+        .expect("Logger 注册失败");
 
     println!("=== KTV投屏DLNA应用启动 ===");
     println!("输入房间链接，如 http://127.0.0.1:1145/102 或 https://ktv.example.com/102");
@@ -141,7 +153,7 @@ async fn main() -> Result<()> {
     // 现在显示并启用进度条
     
     // 初始化 env_logger 并创建 ProgressBar，播放进度由轮询处直接更新
-    let env_log = env_logger::Builder::from_default_env().build();
+    
     pb.set_style(
         ProgressStyle::with_template("{bar:40.green/blue} {my_pos} / {my_len}")
             .expect("invalid style")
@@ -154,19 +166,14 @@ async fn main() -> Result<()> {
             .progress_chars("━━━")
     );
 
-    // 注册logger box接管日志
-    let custom_logger = ProgressLogger {
-        inner: Box::new(env_log),
-        pb: pb.clone(),
-    };
-    log::set_boxed_logger(Box::new(custom_logger))
-        .map(|()| log::set_max_level(LevelFilter::Info))
-        .expect("Logger 注册失败");
+   
 
     pb.set_draw_target(ProgressDrawTarget::stdout());
 
+    let _ = terminal::enable_raw_mode();
+    let controller_for_update = controller.clone();
     playlist_manager.start_periodic_update(move |url| {
-        let controller = controller.clone();
+        let controller = controller_for_update.clone();
         let device = device.clone();
         Box::pin(async move {
             loop {
@@ -301,6 +308,7 @@ async fn main() -> Result<()> {
         })
     });
 
+    let device_for_poll = device_cloned.clone();
     tokio::spawn(async move {
         let controller = DlnaController::new();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -320,7 +328,7 @@ async fn main() -> Result<()> {
 
             // 重试get_secs
             loop {
-                match controller.get_secs(&device_cloned).await {
+                match controller.get_secs(&device_for_poll).await {
                     Ok(result) => {
                         (current_secs, _) = result;
 
@@ -383,6 +391,62 @@ async fn main() -> Result<()> {
             }
         }
     });
+    
+    let controller_kb = controller.clone(); 
+    let device_kb = device_cloned.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        let mut last_action_time = std::time::Instant::now();
+        let debounce_duration = std::time::Duration::from_millis(500);
+        let mut paused_lock = false;
+
+        loop {
+            // event::read() 在这里阻塞是安全的，因为它在专门的阻塞线程池中
+            if let Ok(event::Event::Key(key)) = event::read() {
+                
+                // 1. 处理 Ctrl + C 退出
+                if key.code == event::KeyCode::Char('c') && key.modifiers.contains(event::KeyModifiers::CONTROL) {
+                    let _ = terminal::disable_raw_mode();
+                    log::info!("检测到 Ctrl+C，正在退出...");
+                    std::process::exit(0);
+                }
+
+                // 2. 过滤掉按键释放事件 (Windows 必须)
+                if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
+
+                // 3. 处理 Ctrl + P 播放/暂停
+                if key.code == event::KeyCode::Char('p') && key.modifiers.contains(event::KeyModifiers::CONTROL) {
+                    
+                    if last_action_time.elapsed() < debounce_duration {
+                        continue; 
+                    }
+
+                    // 使用 block_on 回到异步环境执行具体的网络请求
+                    rt.block_on(async {
+                        if paused_lock {
+                            log::info!("检测到 Ctrl+P: 尝试恢复播放...");
+                            if let Ok(_) = controller_kb.play(&device_kb).await {
+                                paused_lock = false;
+                                last_action_time = std::time::Instant::now();
+                                log::info!("▶ 已恢复播放");
+                            }
+                        } else {
+                            log::info!("检测到 Ctrl+P: 尝试暂停播放...");
+                            if let Ok(_) = controller_kb.pause(&device_kb).await {
+                                paused_lock = true;
+                                last_action_time = std::time::Instant::now();
+                                log::info!("⏸ 已暂停");
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
     server.await?;
 
     println!("应用已退出");

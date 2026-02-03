@@ -44,6 +44,7 @@ anyhow = "1.0"
 
 # WebSocket client for optional WS sync (used when KTV_SYNC_MODE=WS)
 tokio-tungstenite = { version = "0.22", features = ["rustls-tls-webpki-roots"] }
+crossterm = "0.29.0"
 
 [patch.crates-io]
 rupnp = { git = "https://github.com/aspromise/rupnp.git", branch = "fix/control-endpoint-leading-slash" }
