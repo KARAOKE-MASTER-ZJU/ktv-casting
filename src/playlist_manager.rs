@@ -149,7 +149,7 @@ impl PlaylistManager {
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
-        let mode = env::var("KTV_SYNC_MODE").unwrap_or_else(|_| "POLLING".to_string());
+        let mode = env::var("KTV_SYNC_MODE").unwrap_or_else(|_| "WS".to_string());
         if mode.to_uppercase() == "WS" {
             self.start_ws_update(f_on_update);
         } else {
@@ -182,6 +182,14 @@ impl PlaylistManager {
                 match connect_async(ws_url).await {
                     Ok((ws_stream, _)) => {
                         info!("WebSocket connected for room {}", self_clone.room_id);
+                        match self_clone.fetch_playlist().await {
+                            Ok(Some(url)) => {
+                                info!("WS 连接成功，初始化播放: {}", url);
+                                f_on_update(url).await; // 触发你 main 里的那一长串投屏逻辑
+                            }
+                            Ok(None) => debug!("歌单目前为空，等待点歌..."),
+                            Err(e) => error!("初始化拉取失败: {}", e),
+                        }
                         let (mut write, mut read) = ws_stream.split();
 
                         // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换

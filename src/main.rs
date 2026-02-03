@@ -4,14 +4,14 @@ use anyhow::{Context, Result, bail};
 use local_ip_address::local_ip;
 use log::{error, info, warn, debug, Log, Metadata, Record, LevelFilter};
 use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget,ProgressState};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind};
+use crossterm::event::{self};
 use crossterm::terminal;
 use std::fmt::Write;
 use playlist_manager::PlaylistManager;
 use reqwest::Client;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use url::{Position, Url};
@@ -66,8 +66,9 @@ async fn main() -> Result<()> {
         inner: Box::new(env_log),
         pb: pb.clone(),
     };
+    let max_level = log::LevelFilter::Debug;
     log::set_boxed_logger(Box::new(custom_logger))
-        .map(|()| log::set_max_level(LevelFilter::Info))
+        .map(|()| log::set_max_level(max_level))
         .expect("Logger 注册失败");
 
     println!("=== KTV投屏DLNA应用启动 ===");
@@ -172,7 +173,7 @@ async fn main() -> Result<()> {
 
     let _ = terminal::enable_raw_mode();
     let controller_for_update = controller.clone();
-    playlist_manager.start_periodic_update(move |url| {
+    playlist_manager.start_sync(move |url| {
         let controller = controller_for_update.clone();
         let device = device.clone();
         Box::pin(async move {
