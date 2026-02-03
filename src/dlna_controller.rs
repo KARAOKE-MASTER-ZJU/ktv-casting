@@ -104,7 +104,7 @@ fn log_upnp_action(service: &rupnp::Service, base_url: &Uri, action: &str, args_
     // Logged body is a best-effort “wire-like” payload for diffing.
     let envelope = build_soap_envelope(action, args_xml);
 
-    log::info!(
+    log::debug!(
         "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction={}",
         base_url,
         service.service_id(),
@@ -129,7 +129,7 @@ async fn avtransport_action_compat(
     // 首先尝试使用 rupnp 原生的 action 方法（适用于Windows Media Player等标准设备）
     match service.action(base_url, action, args_xml).await {
         Ok(response) => {
-            log::info!("UPnP Action (native) succeeded");
+            log::debug!("UPnP Action (native) succeeded");
             log::debug!("UPnP Action (native) response: {:?}", response);
             return Ok(response);
         }
@@ -686,7 +686,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         // RenderingControl uses a different service; still log with a reasonable SOAPAction.
-        log::info!(
+        log::debug!(
             "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction=\"urn:schemas-upnp-org:service:RenderingControl:1#{}\"",
             base_url,
             rendering_control.service_id(),
@@ -731,7 +731,7 @@ impl DlnaController {
             "#;
 
         let base_url = device_location_uri(device)?;
-        log::info!(
+        log::debug!(
             "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction=\"urn:schemas-upnp-org:service:RenderingControl:1#{}\"",
             base_url,
             rendering_control.service_id(),

@@ -2,7 +2,9 @@ use crate::dlna_controller::DlnaController;
 use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, bail};
 use local_ip_address::local_ip;
-use log::{error, info, warn};
+use log::{error, info, warn, debug, Log, Metadata, Record, LevelFilter};
+use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget,ProgressState};
+use std::fmt::Write;
 use playlist_manager::PlaylistManager;
 use reqwest::Client;
 use std::io;
@@ -18,6 +20,31 @@ mod media_server;
 mod mp4_util;
 mod playlist_manager;
 
+/// 包装日志器：在输出其他日志前暂停/恢复进度条，确保进度条始终置底且不被日志打断
+struct ProgressLogger {
+    inner: Box<dyn Log>,
+    pb: ProgressBar,
+}
+
+impl Log for ProgressLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            // 在输出日志前暂停进度条，避免日志内容插入进度条下方
+            self.pb.suspend(|| {
+                self.inner.log(record);
+            });
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
 pub struct SharedState {
     pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
 }
@@ -29,7 +56,7 @@ async fn main() -> Result<()> {
             std::env::set_var("RUST_LOG", "INFO");
         }
     }
-    env_logger::init();
+    let pb = ProgressBar::new(0);
 
     println!("=== KTV投屏DLNA应用启动 ===");
     println!("输入房间链接，如 http://127.0.0.1:1145/102 或 https://ktv.example.com/102");
@@ -110,6 +137,34 @@ async fn main() -> Result<()> {
     }
     let device = devices[device_num].clone(); // clone owned copy
     let device_cloned = device.clone();
+
+    // 现在显示并启用进度条
+    
+    // 初始化 env_logger 并创建 ProgressBar，播放进度由轮询处直接更新
+    let env_log = env_logger::Builder::from_default_env().build();
+    pb.set_style(
+        ProgressStyle::with_template("{bar:40.green/blue} {my_pos} / {my_len}")
+            .expect("invalid style")
+            .with_key("my_pos", |state: &ProgressState, w: &mut dyn Write| {
+                write!(w, "{:02}:{:02}", state.pos() / 60, state.pos() % 60).unwrap()
+            })
+            .with_key("my_len", |state: &ProgressState, w: &mut dyn Write| {
+                write!(w, "{:02}:{:02}", state.len().unwrap_or(0) / 60, state.len().unwrap_or(0) % 60).unwrap()
+            })
+            .progress_chars("━━━")
+    );
+
+    // 注册logger box接管日志
+    let custom_logger = ProgressLogger {
+        inner: Box::new(env_log),
+        pb: pb.clone(),
+    };
+    log::set_boxed_logger(Box::new(custom_logger))
+        .map(|()| log::set_max_level(LevelFilter::Info))
+        .expect("Logger 注册失败");
+
+    pb.set_draw_target(ProgressDrawTarget::stdout());
+
     playlist_manager.start_periodic_update(move |url| {
         let controller = controller.clone();
         let device = device.clone();
@@ -272,7 +327,7 @@ async fn main() -> Result<()> {
                         // 如果从缓存拿到了长度，
                         if cached_total > 0 {
                             total_secs = cached_total;
-                            info!("使用缓存的视频时长: {}s", total_secs);
+                            debug!("使用缓存的视频时长: {}s", total_secs);
                         }
 
                         let remaining_secs = if total_secs > current_secs {
@@ -281,10 +336,11 @@ async fn main() -> Result<()> {
                             0
                         };
 
-                        info!(
-                            "获取播放进度成功，当前时间{}秒，总时间{}秒，剩余时间{}秒",
-                            current_secs, total_secs, remaining_secs
-                        );
+                        // 使用 ProgressBar 显示播放进度（代替日志）
+                        if total_secs > 0 {
+                            pb.set_length(total_secs as u64);
+                        }
+                        pb.set_position(current_secs as u64);
 
                         if remaining_secs <= 2 && total_secs > 0 {
                             info!(
