@@ -163,6 +163,10 @@ impl PlaylistManager {
     {
         let mut self_clone = self.clone();
         tokio::spawn(async move {
+            /*
+                这是维护WebSocket连接的循环
+                负责连接、重连
+             */
             loop {
                 // 构造 WS URL （将 http(s) -> ws(s)）
                 let nickname = env::var("KTV_NICKNAME").unwrap_or_default();
@@ -179,72 +183,64 @@ impl PlaylistManager {
 
                 debug!("尝试连接 WS: {}", ws_url);
 
-                match connect_async(ws_url).await {
-                    Ok((ws_stream, _)) => {
-                        info!("WebSocket connected for room {}", self_clone.room_id);
-                        match self_clone.fetch_playlist().await {
-                            Ok(Some(url)) => {
-                                info!("WS 连接成功，初始化播放: {}", url);
-                                f_on_update(url).await;
-                            }
-                            Ok(None) => debug!("歌单目前为空，等待点歌..."),
-                            Err(e) => error!("初始化拉取失败: {}", e),
-                        }
-                        let (mut write, mut read) = ws_stream.split();
-
-                        // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
-                        let mut song_playing_cached: Option<String> = self_clone.song_playing.lock().await.clone();
-
-                        // 监听消息
-                        while let Some(msg) = read.next().await {
-                            match msg {
-                                Ok(Message::Text(txt)) => {
-                                    match serde_json::from_str::<serde_json::Value>(&txt) {
-                                        Ok(v) => {
-                                            if v["type"].as_str().unwrap_or("") == "UPDATE" {
-                                                let incoming_hash = v["hash"].as_str().unwrap_or("");
-                                                let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
-                                                if incoming_hash != current_hash {
-                                                    debug!("收到 WS UPDATE，hash 不同，触发拉取: {} -> {}", current_hash, incoming_hash);
-                                                    match self_clone.fetch_playlist().await {
-                                                        Ok(song_playing_new) => {
-                                                            // 仅当“正在播放”的歌曲实际变化时才触发投屏切换回调
-                                                            if song_playing_new != song_playing_cached {
-                                                                if let Some(url) = song_playing_new.clone() {
-                                                                    f_on_update(url).await;
-                                                                }
-                                                                // 更新本地缓存，保持与 state 同步
-                                                                song_playing_cached = song_playing_new;
-                                                            } else {
-                                                                debug!("WS UPDATE 仅更改队列，正在播放未变，不触发切歌");
-                                                            }
-                                                        }
-                                                        Err(e) => error!("WS 触发拉取失败: {}", e),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => error!("解析 WS 消息失败: {}", e),
-                                    }
-                                }
-                                Ok(Message::Ping(p)) => {
-                                    let _ = write.send(Message::Pong(p)).await;
-                                }
-                                Ok(Message::Close(_)) => {
-                                    info!("WebSocket closed by server, reconnecting in 3s...");
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!("WebSocket read 错误: {}", e);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                let (ws_stream, _) = match connect_async(ws_url).await {
+                    Ok(val) => val,
                     Err(e) => {
                         error!("连接 WebSocket 失败: {}", e);
+                        continue;
                     }
+                };
+                
+                info!("WebSocket connected for room {}", self_clone.room_id);
+                match self_clone.fetch_playlist().await {
+                    Ok(Some(url)) => {
+                        info!("WS 连接成功，初始化播放: {}", url);
+                        f_on_update(url).await;
+                    }
+                    Ok(None) => debug!("歌单目前为空，等待点歌..."),
+                    Err(e) => error!("初始化拉取失败: {}", e),
+                }
+                let (mut write, mut read) = ws_stream.split();
+
+                // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
+                let mut song_playing_cached: Option<String> = self_clone.song_playing.lock().await.clone();
+
+                /*
+                    监听ws消息的循环
+                 */
+                while let Some(msg) = read.next().await {
+                    let text = match msg {
+                        Ok(Message::Text(txt)) => txt,
+                        Ok(Message::Ping(p)) => {let _ = write.send(Message::Pong(p)).await; continue;},
+                        Ok(Message::Close(_)) => {info!("WebSocket closed by server, reconnecting in 3s..."); break;},
+                        Err(e) => {error!("WebSocket read 错误: {}", e); break;},
+                        _ => continue,
+                    };
+                    let v = match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(v) => {v}
+                            Err(e) => {error!("解析 WS 消息失败: {}", e); continue;},
+                    };
+                    if v["type"].as_str().unwrap_or("") != "UPDATE" {
+                        continue;
+                    }
+                    
+                    let incoming_hash = v["hash"].as_str().unwrap_or("");
+                    let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
+                    if incoming_hash == current_hash {
+                        continue;
+                    }
+                    debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
+                    let song_playing_new = match self_clone.fetch_playlist().await {
+                        Ok(song_playing_new) => song_playing_new,
+                        Err(e) => {error!("WS 触发拉取失败: {}", e); continue;},
+                    };
+                    // 仅当“正在播放”的歌曲实际变化时才触发投屏切换
+                    if song_playing_new == song_playing_cached { debug!("[WS UPDATE] 播放歌曲未变，跳过投屏切换"); continue; }
+                    if let Some(url) = song_playing_new.clone() {
+                        f_on_update(url).await;
+                    }
+                    // 更新本地缓存
+                    song_playing_cached = song_playing_new;
                 }
 
                 // 等待并重连
