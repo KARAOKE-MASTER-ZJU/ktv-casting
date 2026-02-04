@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::json;
 use std::pin::Pin;
@@ -175,56 +175,78 @@ impl PlaylistManager {
                 };
                 
                 info!("WebSocket connected for room {}", self_clone.room_id);
+
+                // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
+                let mut song_playing_cached: Option<String> = self_clone.song_playing.lock().await.clone();
                 match self_clone.fetch_playlist().await {
                     Ok(Some(url)) => {
-                        info!("WS 连接成功，初始化播放: {}", url);
-                        f_on_update(url).await;
+                        if Some(url.clone()) != song_playing_cached {
+                        info!("检测到新歌曲，初始化投屏: {}", url);
+                        f_on_update(url.clone()).await;
+                        song_playing_cached = Some(url);
+                    } else {
+                        info!("重连成功，歌曲未变，跳过重复投屏");
+                    }
                     }
                     Ok(None) => debug!("歌单目前为空，等待点歌..."),
                     Err(e) => error!("初始化拉取失败: {}", e),
                 }
                 let (mut write, mut read) = ws_stream.split();
 
-                // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
-                let mut song_playing_cached: Option<String> = self_clone.song_playing.lock().await.clone();
 
-                /*
-                    监听ws消息的循环
-                 */
-                while let Some(msg) = read.next().await {
-                    let text = match msg {
-                        Ok(Message::Text(txt)) => txt,
-                        Ok(Message::Ping(p)) => {let _ = write.send(Message::Pong(p)).await; continue;},
-                        Ok(Message::Close(_)) => {info!("WebSocket closed by server, reconnecting in 3s..."); break;},
-                        Err(e) => {error!("WebSocket read 错误: {}", e); break;},
-                        _ => continue,
-                    };
-                    let v = match serde_json::from_str::<serde_json::Value>(&text) {
-                            Ok(v) => {v}
-                            Err(e) => {error!("解析 WS 消息失败: {}", e); continue;},
-                    };
-                    if v["type"].as_str().unwrap_or("") != "UPDATE" {
-                        continue;
+                // 引入心跳计时器
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+                heartbeat.tick().await; // 立即触发第一次心跳
+
+                loop {
+                tokio::select! {
+                    // 分支 A：定时发送心跳 (Ping)
+                    _ = heartbeat.tick() => {
+                        if let Err(e) = write.send(Message::Ping(vec![])).await {
+                            warn!("发送心跳失败: {}, 准备重连", e);
+                            break; 
+                        }
                     }
-                    
-                    let incoming_hash = v["hash"].as_str().unwrap_or("");
-                    let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
-                    if incoming_hash == current_hash {
-                        continue;
+
+                    // 分支 B：接收 WS 消息
+                    msg = read.next() => {
+                        let msg = match msg {
+                            Some(Ok(m)) => m,
+                            Some(Err(e)) => { error!("WS 读取错误: {}", e); break; },
+                            None => { info!("WS 连接关闭"); break; }
+                        };
+
+                        match msg {
+                            Message::Text(text) => {
+                                let v = match serde_json::from_str::<serde_json::Value>(&text) {
+                                    Ok(v) => v,
+                                    Err(e) => { error!("解析 JSON 失败: {}", e); continue; },
+                                };
+                                if v["type"].as_str().unwrap_or("") != "UPDATE" { continue; }
+
+                                let incoming_hash = v["hash"].as_str().unwrap_or("");
+                                let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
+                                if incoming_hash == current_hash { continue; }
+
+                                debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
+                                if let Ok(song_playing_new) = self_clone.fetch_playlist().await {
+                                    if song_playing_new != song_playing_cached {
+                                        if let Some(url) = song_playing_new.clone() {
+                                            f_on_update(url).await;
+                                        }
+                                        song_playing_cached = song_playing_new;
+                                    }
+                                }
+                            }
+                            Message::Ping(p) => {
+                                let _ = write.send(Message::Pong(p)).await;
+                            }
+                            Message::Close(_) => { info!("服务器关闭连接"); break; }
+                            _ => {}
+                        }
                     }
-                    debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
-                    let song_playing_new = match self_clone.fetch_playlist().await {
-                        Ok(song_playing_new) => song_playing_new,
-                        Err(e) => {error!("WS 触发拉取失败: {}", e); continue;},
-                    };
-                    // 仅当“正在播放”的歌曲实际变化时才触发投屏切换
-                    if song_playing_new == song_playing_cached { debug!("[WS UPDATE] 播放歌曲未变，跳过投屏切换"); continue; }
-                    if let Some(url) = song_playing_new.clone() {
-                        f_on_update(url).await;
-                    }
-                    // 更新本地缓存
-                    song_playing_cached = song_playing_new;
                 }
+            }
 
                 // 等待并重连
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -237,7 +259,7 @@ impl PlaylistManager {
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
-        let mut self_clone = self.clone();
+        let self_clone = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
             let mut song_playing: Option<String> = None;
