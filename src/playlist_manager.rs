@@ -18,6 +18,7 @@ use url::Url;
 pub struct PlaylistManager {
     url: String,
     room_id: u64,
+    client: Client,
     hash: Arc<Mutex<Option<String>>>,
     playlist: Arc<Mutex<Vec<String>>>,
     song_playing: Arc<Mutex<Option<String>>>,
@@ -25,9 +26,15 @@ pub struct PlaylistManager {
 
 impl PlaylistManager {
     pub fn new(url: &str, room_id: u64, playlist: Arc<Mutex<Vec<String>>>) -> Self {
+        // 在初始化时构建一次 Client
+        let client = Client::builder()
+            .use_rustls_tls()
+            .build()
+            .expect("构建 HTTP 客户端失败");
         Self {
             url: url.to_string(),
             room_id,
+            client,
             hash: Arc::new(Mutex::new(None)),
             playlist,
             song_playing: Arc::new(Mutex::new(None)),
@@ -41,15 +48,9 @@ impl PlaylistManager {
     //   hash: string
     // }
     // Song { id, title, url, addedBy? }
-    async fn fetch_playlist(&mut self) -> Result<Option<String>, String> {
-        let client = Client::builder()
-            .use_rustls_tls()
-            .build()
-            .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+    async fn fetch_playlist(&self) -> Result<Option<String>, String> {
 
-        let hash_guard = self.hash.lock().await;
-        let last_hash = hash_guard.clone().unwrap_or("EMPTY_LIST_HASH".to_string());
-        drop(hash_guard); // 释放锁，避免长时间持有
+        let last_hash = self.hash.lock().await.clone().unwrap_or_else(|| "EMPTY_LIST_HASH".into());
 
         let url = format!(
             "{}/api/songListInfo?roomId={}&lastHash={}",
@@ -58,7 +59,7 @@ impl PlaylistManager {
 
         debug!("正在获取播放列表: {}", url);
 
-        let resp = client
+        let resp = self.client
             .get(&url)
             .send()
             .await
@@ -105,17 +106,10 @@ impl PlaylistManager {
             Vec::new()
         };
 
-        // 当前正在演唱的歌曲：list.singing.url（回退到 list.sung 的最后一项如果 singing 缺失）
-        let singing_url: Option<String> = resp_json["list"]["singing"]
-            .as_object()
-            .and_then(|_| resp_json["list"]["singing"]["url"].as_str().map(extract_bv_function))
-            .or_else(|| {
-                resp_json["list"]["sung"]
-                    .as_array()
-                    .and_then(|arr| arr.last())
-                    .and_then(|last| last["url"].as_str())
-                    .map(extract_bv_function)
-            });
+        // 当前正在演唱的歌曲：list.singing.url
+        let singing_url: Option<String> = resp_json["list"]["singing"]["url"]
+            .as_str()
+            .map(extract_bv_function);
 
         info!("获取到 {} 个URL，新的hash: {}", urls.len(), new_hash);
 
@@ -124,21 +118,10 @@ impl PlaylistManager {
             debug!("  {}. {}", i + 1, url);
         }
 
-        // 更新播放列表
-        let mut playlist = self.playlist.lock().await;
-        playlist.clear();
-        playlist.extend(urls);
-        drop(playlist); // 释放锁，避免长时间持有
-
-        // 更新当前歌曲
-        let mut song_playing = self.song_playing.lock().await;
-        *song_playing = singing_url.clone();
-        drop(song_playing);
-
-        // 更新 hash 值
-        let mut hash = self.hash.lock().await;
-        *hash = Some(new_hash);
-        drop(hash); // 释放锁
+        // 更新状态
+        *self.playlist.lock().await = urls;
+        *self.song_playing.lock().await = singing_url.clone();
+        *self.hash.lock().await = Some(new_hash);
 
         Ok(singing_url)
     }
@@ -161,7 +144,7 @@ impl PlaylistManager {
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
-        let mut self_clone = self.clone();
+        let self_clone = self.clone();
         tokio::spawn(async move {
             /*
                 这是维护WebSocket连接的循环
@@ -283,11 +266,7 @@ impl PlaylistManager {
             .await
             .clone()
             .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
-        let client = Client::builder()
-            .use_rustls_tls()
-            .build()
-            .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
-        let resp = client
+        let resp = self.client
             .post(&url)
             .json(&json!({"idArrayHash": temp_hash}))
             .send()
