@@ -143,14 +143,14 @@ impl PlaylistManager {
         Ok(singing_url)
     }
 
-    // 新增：根据环境变量切换同步驱动（WS / POLLING）
-    // 环境变量：KTV_SYNC_MODE = "WS" 或 "POLLING"（不区分大小写），默认为 POLLING
+    // 根据环境变量切换同步驱动（WS / POLLING）
+    // 环境变量：KTV_SYNC_MODE = "WS" 或 "POLLING"（不区分大小写），默认为 WS
     pub fn start_sync<F>(&self, f_on_update: F)
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
         let mode = env::var("KTV_SYNC_MODE").unwrap_or_else(|_| "WS".to_string());
-        if mode.to_uppercase() == "WS" {
+        if mode.to_uppercase() != "POLLING" {
             self.start_ws_update(f_on_update);
         } else {
             self.start_periodic_update(f_on_update);
