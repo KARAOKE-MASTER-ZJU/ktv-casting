@@ -150,6 +150,10 @@ impl PlaylistManager {
                 这是维护WebSocket连接的循环
                 负责连接、重连
              */
+            let interval_secs = env::var("KEEP_ALIVE_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
             loop {
                 // 构造 WS URL （将 http(s) -> ws(s)）
                 let nickname = env::var("KTV_NICKNAME").unwrap_or_default();
@@ -181,12 +185,12 @@ impl PlaylistManager {
                 match self_clone.fetch_playlist().await {
                     Ok(Some(url)) => {
                         if Some(url.clone()) != song_playing_cached {
-                        info!("检测到新歌曲，初始化投屏: {}", url);
-                        f_on_update(url.clone()).await;
-                        song_playing_cached = Some(url);
-                    } else {
-                        info!("重连成功，歌曲未变，跳过重复投屏");
-                    }
+                            info!("检测到新歌曲，初始化投屏: {}", url);
+                            f_on_update(url.clone()).await;
+                            song_playing_cached = Some(url);
+                        } else {
+                            info!("重连成功，歌曲未变，跳过重复投屏");
+                        }
                     }
                     Ok(None) => debug!("歌单目前为空，等待点歌..."),
                     Err(e) => error!("初始化拉取失败: {}", e),
@@ -195,58 +199,73 @@ impl PlaylistManager {
 
 
                 // 引入心跳计时器
-                let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-                heartbeat.tick().await; // 立即触发第一次心跳
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(interval_secs));
+                // 设置为延迟触发模式，避免不必要的积压和短间隔
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // 立即触发第一次心跳
+                heartbeat.tick().await;
 
                 loop {
-                tokio::select! {
-                    // 分支 A：定时发送心跳 (Ping)
-                    _ = heartbeat.tick() => {
-                        if let Err(e) = write.send(Message::Ping(vec![])).await {
-                            warn!("发送心跳失败: {}, 准备重连", e);
-                            break; 
+                    tokio::select! {
+                        // 分支 A：定时发送心跳
+                        _ = heartbeat.tick() => {
+                            // 发送 WebSocket 协议层 Ping (维持 WS 长连接)
+                            if let Err(e) = write.send(Message::Ping(vec![])).await {
+                                warn!("发送 WS 心跳失败: {}, 准备重连", e);
+                                break; 
+                            }
+
+                            // Keep-Alive HTTP Connection Pool
+                            let pm_warm = self_clone.clone(); 
+                            tokio::spawn(async move {
+                                // 调用 fetch_playlist 会执行一次完整的 HTTP GET 请求
+                                // 从而让 reqwest 保持与后端的 TCP 连接处于活跃状态
+                                match pm_warm.fetch_playlist().await {
+                                    Ok(_) => debug!("HTTP Keep-Alive"),
+                                    Err(e) => debug!("HTTP Keep-Alive Failed: {}", e),
+                                }
+                            });
                         }
-                    }
 
-                    // 分支 B：接收 WS 消息
-                    msg = read.next() => {
-                        let msg = match msg {
-                            Some(Ok(m)) => m,
-                            Some(Err(e)) => { error!("WS 读取错误: {}", e); break; },
-                            None => { info!("WS 连接关闭"); break; }
-                        };
+                        // 分支 B：接收 WS 消息
+                        msg = read.next() => {
+                            let msg = match msg {
+                                Some(Ok(m)) => m,
+                                Some(Err(e)) => { error!("WS 读取错误: {}", e); break; },
+                                None => { info!("WS 连接关闭"); break; }
+                            };
 
-                        match msg {
-                            Message::Text(text) => {
-                                let v = match serde_json::from_str::<serde_json::Value>(&text) {
-                                    Ok(v) => v,
-                                    Err(e) => { error!("解析 JSON 失败: {}", e); continue; },
-                                };
-                                if v["type"].as_str().unwrap_or("") != "UPDATE" { continue; }
+                            match msg {
+                                Message::Text(text) => {
+                                    let v = match serde_json::from_str::<serde_json::Value>(&text) {
+                                        Ok(v) => v,
+                                        Err(e) => { error!("解析 JSON 失败: {}", e); continue; },
+                                    };
+                                    if v["type"].as_str().unwrap_or("") != "UPDATE" { continue; }
+                                    info!("收到 WS UPDATE 消息: {:?}", v);
+                                    let incoming_hash = v["hash"].as_str().unwrap_or("");
+                                    let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
+                                    if incoming_hash == current_hash { continue; }
 
-                                let incoming_hash = v["hash"].as_str().unwrap_or("");
-                                let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
-                                if incoming_hash == current_hash { continue; }
-
-                                debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
-                                if let Ok(song_playing_new) = self_clone.fetch_playlist().await {
-                                    if song_playing_new != song_playing_cached {
-                                        if let Some(url) = song_playing_new.clone() {
-                                            f_on_update(url).await;
+                                    debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
+                                    if let Ok(song_playing_new) = self_clone.fetch_playlist().await {
+                                        if song_playing_new != song_playing_cached {
+                                            if let Some(url) = song_playing_new.clone() {
+                                                f_on_update(url).await;
+                                            }
+                                            song_playing_cached = song_playing_new;
                                         }
-                                        song_playing_cached = song_playing_new;
                                     }
                                 }
+                                Message::Ping(p) => {
+                                    let _ = write.send(Message::Pong(p)).await;
+                                }
+                                Message::Close(_) => { info!("服务器关闭连接"); break; }
+                                _ => {}
                             }
-                            Message::Ping(p) => {
-                                let _ = write.send(Message::Pong(p)).await;
-                            }
-                            Message::Close(_) => { info!("服务器关闭连接"); break; }
-                            _ => {}
                         }
                     }
                 }
-            }
 
                 // 等待并重连
                 tokio::time::sleep(Duration::from_secs(3)).await;
