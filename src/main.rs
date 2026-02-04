@@ -58,6 +58,9 @@ async fn main() -> Result<()> {
             std::env::set_var("RUST_LOG", "INFO");
         }
     }
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
     let pb = ProgressBar::new(0);
     pb.set_draw_target(ProgressDrawTarget::hidden());
     let env_log = env_logger::Builder::from_default_env().build();

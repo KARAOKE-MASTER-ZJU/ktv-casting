@@ -1359,6 +1359,7 @@ dependencies = [
  "mp4",
  "reqwest",
  "rupnp",
+ "rustls 0.23.36",
  "serde",
  "serde_json",
  "tokio",
