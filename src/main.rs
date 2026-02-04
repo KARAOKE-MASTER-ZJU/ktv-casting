@@ -2,7 +2,7 @@ use crate::dlna_controller::DlnaController;
 use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, bail};
 use local_ip_address::local_ip;
-use log::{error, info, warn, debug, Log, Metadata, Record, LevelFilter};
+use log::{error, info, warn, debug, Log, Metadata, Record};
 use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget,ProgressState};
 use crossterm::event::{self};
 use crossterm::terminal;
@@ -86,21 +86,31 @@ async fn main() -> Result<()> {
     let base_url = parsed_url[..Position::AfterPort].to_string();
     info!("Base URL: {}", base_url);
 
-    // ③ 从路径中取最后一段（非空）作为 room_id
-    let segments: Vec<&str> = parsed_url
-        .path_segments()
-        .map(|s| s.filter(|seg| !seg.is_empty()).collect())
-        .unwrap_or_default();
 
-    if segments.is_empty() {
-        error!("错误：没有找到房间号");
-        bail!("No room id")
-    }
+    // 尝试从不同的地方获取 room_id
+    let room_id_result: Option<String> = {
+        // 优先尝试从查询参数 ?roomId=123 中获取
+        let query_room_id = parsed_url.query_pairs()
+            .find(|(key, _)| key == "roomId")
+            .map(|(_, value)| value.into_owned());
 
-    let room_str = segments.last().unwrap();
+        if query_room_id.is_some() {
+            query_room_id
+        } else {
+            // 如果 Query 里没有，回退到原来的路径末尾逻辑
+            parsed_url.path_segments()
+                .and_then(|s| s.filter(|seg| !seg.is_empty()).last())
+                .map(|s| s.to_string())
+        }
+    };
+    // 检查结果
+    let room_str = room_id_result.with_context(|| "URL 中未找到房间号 (roomId 参数或路径末尾)")?;
+
+    // 解析为 u64
     let room_id: u64 = room_str
         .parse::<u64>()
-        .with_context(|| format!("Error parsing room_str {}", room_str))?;
+        .with_context(|| format!("房间号解析失败: '{}'", room_str))?;
+
     info!("Parsed room_id: {}", room_id);
 
     let server_port = 8080;
@@ -173,10 +183,14 @@ async fn main() -> Result<()> {
 
     let _ = terminal::enable_raw_mode();
     let controller_for_update = controller.clone();
+
+    //同步播放列表更新到DLNA设备
     playlist_manager.start_sync(move |url| {
         let controller = controller_for_update.clone();
         let device = device.clone();
         Box::pin(async move {
+
+            // 重试直到stop成功
             loop {
                 match controller.stop(&device).await {
                     Ok(_) => {
@@ -202,7 +216,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-
+            
+            // 重试设置AVTransport URI
             loop {
                 match controller
                     .set_avtransport_uri(&device, &url, "", local_ip, server_port)
@@ -310,6 +325,8 @@ async fn main() -> Result<()> {
     });
 
     let device_for_poll = device_cloned.clone();
+
+    // 轮询播放进度，更新进度条，自动切歌
     tokio::spawn(async move {
         let controller = DlnaController::new();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -395,7 +412,10 @@ async fn main() -> Result<()> {
     
     let controller_kb = controller.clone(); 
     let device_kb = device_cloned.clone();
-
+    /*
+        监听键盘输入，处理 Ctrl + P 播放/暂停 和 Ctrl + C 退出
+        由于 crossterm 的事件读取是阻塞的，因此使用 spawn_blocking
+    */
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         let mut last_action_time = std::time::Instant::now();
@@ -403,22 +423,21 @@ async fn main() -> Result<()> {
         let mut paused_lock = false;
 
         loop {
-            // event::read() 在这里阻塞是安全的，因为它在专门的阻塞线程池中
             if let Ok(event::Event::Key(key)) = event::read() {
                 
-                // 1. 处理 Ctrl + C 退出
+                // 处理 Ctrl + C 退出
                 if key.code == event::KeyCode::Char('c') && key.modifiers.contains(event::KeyModifiers::CONTROL) {
                     let _ = terminal::disable_raw_mode();
                     log::info!("检测到 Ctrl+C，正在退出...");
                     std::process::exit(0);
                 }
 
-                // 2. 过滤掉按键释放事件 (Windows 必须)
+                // 过滤掉按键释放事件
                 if key.kind != event::KeyEventKind::Press {
                     continue;
                 }
 
-                // 3. 处理 Ctrl + P 播放/暂停
+                // 处理 Ctrl + P 播放/暂停
                 if key.code == event::KeyCode::Char('p') && key.modifiers.contains(event::KeyModifiers::CONTROL) {
                     
                     if last_action_time.elapsed() < debounce_duration {

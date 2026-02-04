@@ -185,7 +185,7 @@ impl PlaylistManager {
                         match self_clone.fetch_playlist().await {
                             Ok(Some(url)) => {
                                 info!("WS 连接成功，初始化播放: {}", url);
-                                f_on_update(url).await; // 触发你 main 里的那一长串投屏逻辑
+                                f_on_update(url).await;
                             }
                             Ok(None) => debug!("歌单目前为空，等待点歌..."),
                             Err(e) => error!("初始化拉取失败: {}", e),
