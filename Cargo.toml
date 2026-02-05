@@ -45,6 +45,7 @@ tokio = { version = "1.49.0", features = ["full"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 anyhow = "1.0"
+webpki-roots = "0.26"
 crossterm = "0.29.0"
 
 # 安卓专用依赖

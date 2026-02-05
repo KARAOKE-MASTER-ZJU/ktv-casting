@@ -1,17 +1,20 @@
+use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::json;
+use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, future::Future};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::time::sleep;
-
-use futures_util::{SinkExt, StreamExt};
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{Connector, client_async};
 use url::Url;
 
 #[derive(Clone)]
@@ -180,6 +183,97 @@ impl PlaylistManager {
                 }
 
                 info!("WebSocket Connecting: {}", ws_url);
+
+                // 调试用代码
+                /* let url = match url::Url::parse(&ws_url) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!("URL 解析失败: {}", e);
+                        break;
+                    }
+                };
+                let host = url.host_str().unwrap_or_default().to_string();
+                let port = url.port_or_known_default().unwrap_or(443);
+
+                // 异步 DNS 解析
+                let addrs = match tokio::task::spawn_blocking(move || {
+                    use std::net::ToSocketAddrs;
+                    (host.as_str(), port).to_socket_addrs()
+                })
+                .await
+                {
+                    Ok(Ok(addr_iter)) => addr_iter,
+                    _ => {
+                        error!("DNS 解析失败");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                let addr = match addrs.into_iter().next() {
+                    Some(a) => a,
+                    None => {
+                        error!("DNS 未找到记录");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                info!("DNS 解析成功: {}", addr);
+
+                // 建立 TCP 连接
+                let stream = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    tokio::net::TcpStream::connect(addr),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => {
+                        error!("TCP 连接超时或拒绝");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                info!("TCP 已连接，准备 WS 握手...");
+
+                // WebSocket 握手
+
+                // 加载 webpki 根证书
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                // 2. 创建配置 (支持 TLS 1.2 和 1.3)
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+
+                let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config));
+
+                let (mut ws_stream, _) = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    tokio_tungstenite::client_async_tls_with_config(
+                        ws_url.clone(),
+                        stream,
+                        None,
+                        Some(connector),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(val)) => val,
+                    Ok(Err(e)) => {
+                        error!("WS 握手报错: {:?}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        error!("WS 握手超时");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }; */
 
                 let (ws_stream, _) = match connect_async(ws_url).await {
                     Ok(val) => val,
