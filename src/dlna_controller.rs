@@ -334,7 +334,7 @@ impl DlnaController {
         let devices_stream = rupnp::discover(&search_target, Duration::from_secs(5), None).await?;
 
         let devices: Vec<Result<Device, rupnp::Error>> = devices_stream.collect().await;
-
+        log::debug!("发现设备总数: {}", devices.len());
         let mut dlna_devices = Vec::new();
 
         let mut seen_locations = HashSet::new();
@@ -342,7 +342,6 @@ impl DlnaController {
         for device_result in devices {
             match device_result {
                 Ok(device) => {
-                    // 获取唯一标识（用 location 比较稳，或者 device.udn()）
                     let location = device.url().to_string();
 
                     if !seen_locations.insert(location.clone()) {
