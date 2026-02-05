@@ -5,7 +5,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -330,23 +330,28 @@ impl DlnaController {
     pub async fn discover_devices(&self) -> Result<Vec<DlnaDevice>, rupnp::Error> {
         log::info!("正在搜索DLNA设备...");
 
-        // 使用正确的SearchTarget构造方法 - 搜索AVTransport服务
         let search_target = SearchTarget::URN(AV_TRANSPORT);
         let devices_stream = rupnp::discover(&search_target, Duration::from_secs(5), None).await?;
 
-        // 将Stream转换为Vec
         let devices: Vec<Result<Device, rupnp::Error>> = devices_stream.collect().await;
 
         let mut dlna_devices = Vec::new();
+        // --- 新增：用于去重的集合 ---
+        let mut seen_locations = HashSet::new();
 
         for device_result in devices {
             match device_result {
                 Ok(device) => {
-                    // 检查是否是媒体渲染器设备
+                    // 获取唯一标识（用 location 比较稳，或者 device.udn()）
+                    let location = device.url().to_string();
+
+                    if !seen_locations.insert(location.clone()) {
+                        continue;
+                    }
+
                     let device_type_str = device.device_type().to_string();
                     if device_type_str.contains("MediaRenderer") {
                         let friendly_name = device.friendly_name().to_string();
-                        let location = device.url().to_string();
 
                         // 检查设备是否支持AVTransport服务
                         let services: Vec<URN> = device
