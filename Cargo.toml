@@ -2,25 +2,11 @@
 name = "ktv-casting"
 version = "0.1.0"
 edition = "2024"
-default-run = "ktv-casting"
 
-[[bin]]
-name = "ktv-casting"
-path = "src/main.rs"
-# 设置为默认二进制，这样执行 cargo run 时会直接运行这个
-required-features = []
-
-[[bin]]
-name = "check_rupnp"
-path = "check_rupnp.rs"
-required-features = ["check-rupnp"]
-
-[features]
-# 默认功能集合
-default = []
-
-# 用于编译 check_rupnp 二进制的功能
-check-rupnp = []
+[lib]
+name = "ktv_casting"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"] # 加上 rlib 方便 main.rs 引用
 
 [dependencies]
 actix-files = "0.6.9"
@@ -32,8 +18,25 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 local-ip-address = "0.6.8"
 log = "0.4.29"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls-webpki-roots",
+] }
+
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+
+tokio-tungstenite = { version = "0.22", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "connect",
+    "handshake",
+] }
+
 rupnp = "3.0.0"
 serde = "1.0.228"
 serde_json = "1.0.149"
@@ -42,10 +45,11 @@ tokio = { version = "1.49.0", features = ["full"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 anyhow = "1.0"
-
-# WebSocket client for optional WS sync (used when KTV_SYNC_MODE=WS)
-tokio-tungstenite = { version = "0.22", features = ["rustls-tls-webpki-roots"] }
 crossterm = "0.29.0"
+
+# 安卓专用依赖
+jni = "0.21"
+android_logger = "0.13"
 
 [patch.crates-io]
 rupnp = { git = "https://github.com/aspromise/rupnp.git", branch = "fix/control-endpoint-leading-slash" }

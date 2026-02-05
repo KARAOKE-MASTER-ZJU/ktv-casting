@@ -49,8 +49,12 @@ impl PlaylistManager {
     // }
     // Song { id, title, url, addedBy? }
     async fn fetch_playlist(&self) -> Result<Option<String>, String> {
-
-        let last_hash = self.hash.lock().await.clone().unwrap_or_else(|| "EMPTY_LIST_HASH".into());
+        let last_hash = self
+            .hash
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "EMPTY_LIST_HASH".into());
 
         let url = format!(
             "{}/api/songListInfo?roomId={}&lastHash={}",
@@ -59,7 +63,8 @@ impl PlaylistManager {
 
         debug!("正在获取播放列表: {}", url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .send()
             .await
@@ -133,6 +138,7 @@ impl PlaylistManager {
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
         let mode = env::var("KTV_SYNC_MODE").unwrap_or_else(|_| "WS".to_string());
+        info!("播放列表同步模式: {}", mode);
         if mode.to_uppercase() != "POLLING" {
             self.start_ws_update(f_on_update);
         } else {
@@ -147,18 +153,23 @@ impl PlaylistManager {
         let self_clone = self.clone();
         tokio::spawn(async move {
             /*
-                这是维护WebSocket连接的循环
-                负责连接、重连
-             */
+               这是维护WebSocket连接的循环
+               负责连接、重连
+            */
             let interval_secs = env::var("KEEP_ALIVE_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
+            info!("心跳间隔: {} 秒", interval_secs);
             loop {
                 // 构造 WS URL （将 http(s) -> ws(s)）
                 let nickname = env::var("KTV_NICKNAME").unwrap_or_default();
-                let mut ws_url = format!("{}/api/ws?roomId={}&nickname={}", self_clone.url.trim_end_matches('/'), self_clone.room_id, urlencoding::encode(&nickname));
-
+                let mut ws_url = format!(
+                    "{}/api/ws?roomId={}&nickname={}",
+                    self_clone.url.trim_end_matches('/'),
+                    self_clone.room_id,
+                    urlencoding::encode(&nickname)
+                );
                 if let Ok(mut parsed) = Url::parse(&ws_url) {
                     let _ = match parsed.scheme() {
                         "https" => parsed.set_scheme("wss"),
@@ -168,7 +179,7 @@ impl PlaylistManager {
                     ws_url = parsed.to_string();
                 }
 
-                debug!("尝试连接 WS: {}", ws_url);
+                info!("WebSocket Connecting: {}", ws_url);
 
                 let (ws_stream, _) = match connect_async(ws_url).await {
                     Ok(val) => val,
@@ -177,11 +188,12 @@ impl PlaylistManager {
                         continue;
                     }
                 };
-                
+
                 info!("WebSocket connected for room {}", self_clone.room_id);
 
                 // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
-                let mut song_playing_cached: Option<String> = self_clone.song_playing.lock().await.clone();
+                let mut song_playing_cached: Option<String> =
+                    self_clone.song_playing.lock().await.clone();
                 match self_clone.fetch_playlist().await {
                     Ok(Some(url)) => {
                         if Some(url.clone()) != song_playing_cached {
@@ -197,7 +209,6 @@ impl PlaylistManager {
                 }
                 let (mut write, mut read) = ws_stream.split();
 
-
                 // 引入心跳计时器
                 let mut heartbeat = tokio::time::interval(Duration::from_secs(interval_secs));
                 // 设置为延迟触发模式，避免不必要的积压和短间隔
@@ -212,11 +223,11 @@ impl PlaylistManager {
                             // 发送 WebSocket 协议层 Ping (维持 WS 长连接)
                             if let Err(e) = write.send(Message::Ping(vec![])).await {
                                 warn!("发送 WS 心跳失败: {}, 准备重连", e);
-                                break; 
+                                break;
                             }
 
                             // Keep-Alive HTTP Connection Pool
-                            let pm_warm = self_clone.clone(); 
+                            let pm_warm = self_clone.clone();
                             tokio::spawn(async move {
                                 // 调用 fetch_playlist 会执行一次完整的 HTTP GET 请求
                                 // 从而让 reqwest 保持与后端的 TCP 连接处于活跃状态
@@ -307,7 +318,8 @@ impl PlaylistManager {
             .await
             .clone()
             .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&json!({"idArrayHash": temp_hash}))
             .send()

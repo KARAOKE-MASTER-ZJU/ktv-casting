@@ -336,7 +336,7 @@ impl DlnaController {
         let devices: Vec<Result<Device, rupnp::Error>> = devices_stream.collect().await;
 
         let mut dlna_devices = Vec::new();
-        // --- 新增：用于去重的集合 ---
+
         let mut seen_locations = HashSet::new();
 
         for device_result in devices {
