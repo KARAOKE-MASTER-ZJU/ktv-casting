@@ -68,16 +68,16 @@ pub fn reset_engine() {
 }
 
 /// 获取当前播放进度（秒）
-pub async fn get_current_progress() -> i64 {
+pub async fn get_current_progress() -> (i32, i32) {
     if let Ok(guard) = ENGINE_STATE.read() {
         if let Some(ctx) = guard.as_ref() {
             return match ctx.controller.get_secs(&ctx.device).await {
-                Ok((curr, _)) => curr as i64,
-                Err(_) => -1,
+                Ok((curr, total)) => (curr as i32, total as i32),
+                Err(_) => (-1 , -1),
             };
         }
     }
-    -1
+    (-1, -1)
 }
 
 /// 切换下一首歌曲
@@ -270,4 +270,16 @@ pub async fn discover_devices_core() -> Vec<DlnaDevice> {
         .discover_devices()
         .await
         .unwrap_or_default()
+}
+
+/// 获取当前正在播放的歌曲标题
+pub async fn get_current_song_title_core() -> String {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            // 调用 PlaylistManager 中我们之前添加的 get_song_title
+            return ctx.playlist_manager.get_song_title().await
+                .unwrap_or_else(|| "暂无歌曲".to_string());
+        }
+    }
+    "未连接".to_string()
 }

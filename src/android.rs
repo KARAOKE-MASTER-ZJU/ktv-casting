@@ -2,7 +2,7 @@
 use crate::ENGINE_STATE;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jint, jlong, jobjectArray, jsize};
+use jni::sys::{jint, jobjectArray, jsize, jstring, jintArray};
 use log::info;
 
 // 1. 日志初始化
@@ -103,37 +103,27 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_resetEngine(
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryProgress(
-    _env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
-) -> jlong {
-    if let Ok(guard) = ENGINE_STATE.read() {
+) -> jintArray {
+    let (current, total) = if let Ok(guard) = ENGINE_STATE.read() {
         if let Some(ctx) = guard.as_ref() {
-            return ctx.rt.block_on(crate::get_current_progress()) as jlong;
+            ctx.rt.block_on(crate::get_current_progress())
+        } else {
+            (-1, -1)
         }
-    }
-    -1
-}
+    } else {
+        (-1, -1)
+    };
 
-// 6. 数据接口：获取当前歌曲总时长
-#[allow(non_snake_case)]
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryTotalDuration(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jlong {
-    if let Ok(guard) = ENGINE_STATE.read() {
-        if let Some(ctx) = guard.as_ref() {
-            return ctx.rt.block_on(async {
-                if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
-                    if let Some(&d) = ctx.duration_cache.lock().await.get(&playing) {
-                        return d as jlong;
-                    }
-                }
-                0
-            });
-        }
-    }
-    0
+    let result_array = env.new_int_array(2).expect("无法创建 Java 数组");
+
+    // 将 Rust 的数据放入数组
+    let data = [current as jint, total as jint];
+    env.set_int_array_region(&result_array, 0, &data).expect("无法填充数组数据");
+
+    // 返回 Java 数组引用
+    result_array.into_raw()
 }
 
 // 7. 控制接口：切歌
@@ -226,6 +216,31 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_jumpToSecs(
         }
     }
     -1
+}
+
+// 12. 数据接口：获取当前歌曲标题
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getCurrentSongTitle(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let title = if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            ctx.rt.block_on(async {
+                ctx.playlist_manager.get_song_title().await
+                    .unwrap_or_else(|| "暂无歌曲".to_string())
+            })
+        } else {
+            "引擎未初始化".to_string()
+        }
+    } else {
+        "系统锁异常".to_string()
+    };
+
+    env.new_string(title)
+        .expect("Couldn't create java string!")
+        .into_raw()
 }
 
 
