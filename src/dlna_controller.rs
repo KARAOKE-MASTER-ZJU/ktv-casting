@@ -669,6 +669,39 @@ impl DlnaController {
         Ok((current_secs, total_secs))
     }
 
+    // 设置播放进度（跳转到指定秒数）
+    pub async fn seek(&self, device: &DlnaDevice, seconds: u32) -> Result<(), rupnp::Error> {
+        let avtransport = self
+            .get_avtransport_service(device)
+            .ok_or(rupnp::Error::ParseError("设备不支持AVTransport服务"))?;
+
+        // 将秒数转换为 HH:MM:SS 格式
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let secs = seconds % 60;
+        let target_time = format!("{:02}:{:02}:{:02}", hours, minutes, secs);
+
+        log::info!("正在发送Seek指令，跳转至: {}", target_time);
+
+        // Unit 常用选项:
+        // REL_TIME: 按照时间进度跳转 (最常用)
+        // TRACK_NR: 按照轨道编号跳转
+        let action = "Seek";
+        let args_str = format!(
+            "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{}</Target>",
+            target_time
+        );
+
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, &args_str);
+
+        // 发送请求
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
+        log::info!("Seek响应: {:?}", response);
+
+        Ok(())
+    }
+
     // 设置渲染器音量
     pub async fn set_volume(&self, device: &DlnaDevice, volume: u32) -> Result<(), rupnp::Error> {
         let rendering_control = device

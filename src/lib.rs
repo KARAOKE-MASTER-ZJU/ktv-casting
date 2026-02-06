@@ -93,6 +93,21 @@ pub fn trigger_next_song() {
     }
 }
 
+/// 跳转到指定秒数
+pub async fn jump_to_secs(target_secs: u32) -> Result<(), Box<dyn std::error::Error>> {
+
+    let ctx = {
+        let guard = ENGINE_STATE.read().map_err(|_| "Lock error")?;
+        guard.as_ref().cloned().ok_or("Engine not initialized")?
+    };
+
+    ctx.controller.seek(&ctx.device, target_secs)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    Ok(())
+}
+
 /// 启动引擎核心逻辑
 pub async fn start_engine_core(
     base_url_str: String,
@@ -237,7 +252,7 @@ pub async fn set_volume_core(volume: u32) -> Result<u32, Box<dyn std::error::Err
     let guard = ENGINE_STATE.read().map_err(|_| "Lock error")?;
     let ctx = guard.as_ref().ok_or("Engine not initialized")?;
     let target = volume.clamp(0, 100);
-    ctx.controller.set_volume(&ctx.device, target).await?;
+    ctx.controller.set_volume(&ctx.device, target).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(target)
 }
 
@@ -245,7 +260,7 @@ pub async fn set_volume_core(volume: u32) -> Result<u32, Box<dyn std::error::Err
 pub async fn get_volume_core() -> Result<u32, Box<dyn std::error::Error>> {
     let guard = ENGINE_STATE.read().map_err(|_| "Lock error")?;
     let ctx = guard.as_ref().ok_or("Engine not initialized")?;
-    let v = ctx.controller.get_volume(&ctx.device).await?;
+    let v = ctx.controller.get_volume(&ctx.device).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(v)
 }
 

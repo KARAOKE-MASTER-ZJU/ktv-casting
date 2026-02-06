@@ -69,12 +69,12 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
     mut env: JNIEnv,
     _class: JClass,
     base_url: JString,
-    room_id: jlong,
+    room_id: JString,
     target_location: JString,
 ) {
     let base_url_str: String = env.get_string(&base_url).unwrap().into();
     let loc_str: String = env.get_string(&target_location).unwrap().into();
-    let room_id_u64 = room_id as u64;
+    let room_id_str: String = env.get_string(&room_id).unwrap().into();
 
     std::thread::spawn(move || {
         // 创建 Runtime
@@ -84,7 +84,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
         // 我们需要把 rt 的所有权传给 start_engine_core，所以这里用 handle 来 block_on
         let handle = rt.handle().clone();
         handle.block_on(async {
-            crate::start_engine_core(base_url_str, room_id_u64, loc_str, rt).await;
+            crate::start_engine_core(base_url_str, room_id_str, loc_str, rt).await;
         });
     });
 }
@@ -206,3 +206,26 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getVolume(
     }
     -1
 }
+
+
+// 11. 控制接口：跳转进度 (Seek)
+// 返回 1 表示成功，-1 表示失败
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_jumpToSecs(
+    _env: JNIEnv,
+    _class: JClass,
+    target_secs: jint,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return match ctx.rt.block_on(crate::jump_to_secs(target_secs as u32)) {
+                Ok(_) => 1,
+                Err(_) => -1
+            };
+        }
+    }
+    -1
+}
+
+
