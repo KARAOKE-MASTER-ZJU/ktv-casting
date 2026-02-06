@@ -2,19 +2,15 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::json;
-use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, future::Future};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::time::sleep;
-use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{Connector, client_async};
 use url::Url;
 
 #[derive(Clone)]

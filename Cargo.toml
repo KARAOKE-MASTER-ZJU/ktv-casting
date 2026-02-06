@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "ktv_casting"
+name = "ktv_casting_lib"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"] # 加上 rlib 方便 main.rs 引用
 
