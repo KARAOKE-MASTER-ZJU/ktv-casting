@@ -3,6 +3,7 @@ use crate::ENGINE_STATE;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong, jobjectArray, jsize};
+use log::info;
 
 // 1. 日志初始化
 #[unsafe(no_mangle)]
@@ -22,6 +23,10 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
             .with_max_level(log_level)
             .with_tag("RUST_KTV"),
     );
+    // 顺便把 Crypto 也初始化
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    info!("Android 日志与 Crypto 模块初始化完成");
 }
 
 // 2. 搜索接口
@@ -81,7 +86,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
     });
 }
 
-// 4. 新增接口：重置引擎 (UI 点击重新选择设备时调用)
+// 4. 接口：重置引擎 (UI 点击重新选择设备时调用)
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_resetEngine(
     _env: JNIEnv,
@@ -104,7 +109,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryProgress(
     -1
 }
 
-// 6. 核心接口：获取当前歌曲总时长
+// 6. 数据接口：获取当前歌曲总时长
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryTotalDuration(
     _env: JNIEnv,

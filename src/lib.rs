@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock}; // 改用 RwLock 以支持重置
 use tokio::sync::Mutex;
 
+#[cfg(target_os = "android")]
 pub mod android;
+
 pub mod bilibili_parser;
 pub mod dlna_controller;
 pub mod media_server;
@@ -15,7 +17,7 @@ pub mod mp4_util;
 pub mod playlist_manager;
 
 // --- 全局静态容器：改为 RwLock<Option<...>> 以支持重新初始化 ---
-pub(crate) static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
+pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
 
 pub struct EngineContext {
     pub controller: DlnaController,
@@ -184,8 +186,6 @@ pub async fn start_engine_core(
         local_ip: local_ip_addr,
         server_port: port,
         is_playing: std::sync::atomic::AtomicBool::new(true),
-        // 注意：这里需要修改你的 EngineContext 定义，存储 Handle
-        // 或者在 android.rs 创建 rt 时将其管理起来
         rt,
     });
 

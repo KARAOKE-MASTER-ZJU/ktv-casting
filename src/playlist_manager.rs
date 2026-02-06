@@ -311,7 +311,7 @@ impl PlaylistManager {
                         // 分支 A：定时发送心跳
                         _ = heartbeat.tick() => {
                             // 发送 WebSocket 协议层 Ping (维持 WS 长连接)
-                            if let Err(e) = write.send(Message::Ping(vec![])).await {
+                            if let Err(e) = write.send(Message::Ping(vec![].into())).await {
                                 warn!("发送 WS 心跳失败: {}, 准备重连", e);
                                 break;
                             }
