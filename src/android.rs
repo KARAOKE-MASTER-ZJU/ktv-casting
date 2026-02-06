@@ -6,6 +6,7 @@ use jni::sys::{jint, jlong, jobjectArray, jsize};
 use log::info;
 
 // 1. 日志初始化
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
     _env: JNIEnv,
@@ -30,6 +31,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
 }
 
 // 2. 搜索接口
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_searchDevices(
     mut env: JNIEnv,
@@ -61,6 +63,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_searchDevices(
 }
 
 // 3. 核心初始化接口 (支持重复调用以更换设备)
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
     mut env: JNIEnv,
@@ -87,6 +90,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
 }
 
 // 4. 接口：重置引擎 (UI 点击重新选择设备时调用)
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_resetEngine(
     _env: JNIEnv,
@@ -96,6 +100,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_resetEngine(
 }
 
 // 5. 数据接口：获取当前播放进度
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryProgress(
     _env: JNIEnv,
@@ -110,6 +115,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryProgress(
 }
 
 // 6. 数据接口：获取当前歌曲总时长
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryTotalDuration(
     _env: JNIEnv,
@@ -131,6 +137,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryTotalDuration(
 }
 
 // 7. 控制接口：切歌
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_nextSong(_env: JNIEnv, _class: JClass) {
     crate::trigger_next_song();
@@ -138,6 +145,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_nextSong(_env: JNIEn
 
 // 8. 控制接口：播放/暂停 切换
 // 返回 1 表示播放，0 表示暂停，失败返回 -1
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_togglePause(
     _env: JNIEnv,
@@ -162,6 +170,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_togglePause(
 
 // 9. 控制接口：音量调节
 // 返回设置后的音量，失败返回 -1
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_setVolume(
     _env: JNIEnv,
@@ -181,6 +190,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_setVolume(
 
 // 10. 控制接口：获取当前音量
 // 返回当前音量，失败返回 -1
+#[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getVolume(
     _env: JNIEnv,
