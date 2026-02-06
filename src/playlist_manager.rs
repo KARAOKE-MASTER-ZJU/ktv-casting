@@ -19,12 +19,11 @@ pub struct PlaylistManager {
     room_id: String,
     client: Client,
     hash: Arc<Mutex<Option<String>>>,
-    playlist: Arc<Mutex<Vec<String>>>,
     song_playing: Arc<Mutex<Option<String>>>,
 }
 
 impl PlaylistManager {
-    pub fn new(url: &str, room_id: String, playlist: Arc<Mutex<Vec<String>>>) -> Self {
+    pub fn new(url: &str, room_id: String) -> Self {
         // 在初始化时构建一次 Client
         let client = Client::builder()
             .use_rustls_tls()
@@ -35,7 +34,6 @@ impl PlaylistManager {
             room_id,
             client,
             hash: Arc::new(Mutex::new(None)),
-            playlist,
             song_playing: Arc::new(Mutex::new(None)),
         }
     }
@@ -99,31 +97,14 @@ impl PlaylistManager {
             }
         };
 
-        // 新结构：从 list.queued 中提取待播歌单 URL
-        let urls: Vec<String> = if let Some(queued) = resp_json["list"]["queued"].as_array() {
-            queued
-                .iter()
-                .filter_map(|song| song["url"].as_str())
-                .map(extract_bv_function)
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         // 当前正在演唱的歌曲：list.singing.url
         let singing_url: Option<String> = resp_json["list"]["singing"]["url"]
             .as_str()
             .map(extract_bv_function);
 
-        info!("获取到 {} 个URL，新的hash: {}", urls.len(), new_hash);
-
-        // 打印每个URL用于调试
-        for (i, url) in urls.iter().enumerate() {
-            debug!("  {}. {}", i + 1, url);
-        }
+        info!("新的hash: {}", new_hash);
 
         // 更新状态
-        *self.playlist.lock().await = urls;
         *self.song_playing.lock().await = singing_url.clone();
         *self.hash.lock().await = Some(new_hash);
 
@@ -437,9 +418,7 @@ impl PlaylistManager {
 async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== PlaylistManager 使用示例 ===");
 
-    let playlist = Arc::new(Mutex::new(Vec::<String>::new()));
-
-    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string(), playlist.clone());
+    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string());
 
     println!("开始获取播放列表...");
 
@@ -447,14 +426,14 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     match manager.fetch_playlist().await {
         Ok(_) => {
             println!("✓ 成功获取播放列表");
-            // 【关键点 1】：用大括号包裹锁的使用
+            // 获取当前播放的歌曲
             {
-                let playlist_lock = playlist.lock().await;
-                println!("播放列表内容 ({} 个项目):", playlist_lock.len());
-                for (i, url) in playlist_lock.iter().enumerate() {
-                    println!("  {}. {}", i + 1, url);
+                let song_playing = manager.get_song_playing().await;
+                match &song_playing {
+                    Some(url) => println!("当前播放的歌曲: {}", url),
+                    None => println!("当前没有播放的歌曲"),
                 }
-            } // <--- 锁在这里被强制释放 (DROP)
+            }
         }
         Err(e) => error!("✗ 获取播放列表失败: {}", e),
     }
@@ -463,13 +442,14 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     manager.next_song().await?;
     println!("请求下一首歌曲后播放列表状态:");
 
-    // 【关键点 2】：再次用大括号包裹锁
+    // 获取当前播放的歌曲
     {
-        let playlist_lock = playlist.lock().await;
-        for (i, url) in playlist_lock.iter().enumerate() {
-            println!("  {}. {}", i + 1, url);
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
         }
-    } // <--- 锁在这里被强制释放 (DROP)
+    }
 
     // --- 后台任务开始 ---
     manager.start_periodic_update(|url: String| {
@@ -483,11 +463,12 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("5秒后播放列表状态:");
 
-    // 【关键点 4】：休眠结束后，再次获取锁查看结果
+    // 获取当前播放的歌曲
     {
-        let playlist_lock = playlist.lock().await;
-        for (i, url) in playlist_lock.iter().enumerate() {
-            println!("  {}. {}", i + 1, url);
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
         }
     }
 

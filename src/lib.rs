@@ -133,8 +133,7 @@ pub async fn start_engine_core(
 
     info!("目标设备 IP 地址: {}", target_ip);
 
-    let playlist = Arc::new(Mutex::new(vec![]));
-    let pm = PlaylistManager::new(&base_url_str, room_id, playlist);
+    let pm = PlaylistManager::new(&base_url_str, room_id);
     let cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let shared_state = web::Data::new(SharedState {
