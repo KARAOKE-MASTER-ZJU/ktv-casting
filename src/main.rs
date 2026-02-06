@@ -167,7 +167,7 @@ fn setup_env() -> ProgressBar {
     pb
 }
 
-fn get_room_config_interactively() -> Result<(String, u64)> {
+fn get_room_config_interactively() -> Result<(String, String)> {
     println!("=== KTV投屏DLNA应用启动 ===");
     println!("输入房间链接:");
     let mut input = String::new();
@@ -194,9 +194,7 @@ fn get_room_config_interactively() -> Result<(String, u64)> {
                 .map(|s| s.to_string())
         })
         .with_context(|| "URL 中未找到房间号")?;
-
-    let room_id = room_str.parse::<u64>()?;
-    Ok((base_url, room_id))
+    Ok((base_url, room_str.to_string()))
 }
 
 /// 负责进度查询、自动切歌，并通过回调更新 UI

@@ -16,7 +16,7 @@ use url::Url;
 #[derive(Clone)]
 pub struct PlaylistManager {
     url: String,
-    room_id: u64,
+    room_id: String,
     client: Client,
     hash: Arc<Mutex<Option<String>>>,
     playlist: Arc<Mutex<Vec<String>>>,
@@ -24,7 +24,7 @@ pub struct PlaylistManager {
 }
 
 impl PlaylistManager {
-    pub fn new(url: &str, room_id: u64, playlist: Arc<Mutex<Vec<String>>>) -> Self {
+    pub fn new(url: &str, room_id: String, playlist: Arc<Mutex<Vec<String>>>) -> Self {
         // 在初始化时构建一次 Client
         let client = Client::builder()
             .use_rustls_tls()
@@ -439,7 +439,7 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
 
     let playlist = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", 1111, playlist.clone());
+    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string(), playlist.clone());
 
     println!("开始获取播放列表...");
 

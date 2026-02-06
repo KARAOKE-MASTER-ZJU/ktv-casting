@@ -96,7 +96,7 @@ pub fn trigger_next_song() {
 /// 启动引擎核心逻辑
 pub async fn start_engine_core(
     base_url_str: String,
-    room_id: u64,
+    room_id: String,
     loc_str: String,
     rt: tokio::runtime::Runtime,
 ) {
