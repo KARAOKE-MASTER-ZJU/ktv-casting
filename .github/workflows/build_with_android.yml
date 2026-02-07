@@ -1,0 +1,147 @@
+name: Cross-Platform Build & Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: ["android-app", "main"]
+    tags: ["starfx-v*"]
+  pull_request:
+    branches: ["android-app"]
+
+env:
+  CARGO_TERM_COLOR: always
+  LIB_NAME: ktv_casting_lib
+  BIN_NAME: ktv-cli
+
+jobs:
+  build-and-upload:
+    name: Build - ${{ matrix.platform.release_for }}
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # --- Android 架构 (仅产出 .so 库) ---
+          - {
+              release_for: Android-arm64-v8a,
+              os: ubuntu-latest,
+              target: aarch64-linux-android,
+              abi: arm64-v8a,
+              command: ndk,
+            }
+          - {
+              release_for: Android-armeabi-v7a,
+              os: ubuntu-latest,
+              target: armv7-linux-androideabi,
+              abi: armeabi-v7a,
+              command: ndk,
+            }
+          - {
+              release_for: Android-x86_64,
+              os: ubuntu-latest,
+              target: x86_64-linux-android,
+              abi: x86_64,
+              command: ndk,
+            }
+          - {
+              release_for: Android-x86,
+              os: ubuntu-latest,
+              target: i686-linux-android,
+              abi: x86,
+              command: ndk,
+            }
+
+          # --- 桌面端架构 (产出 CLI) ---
+          - {
+              release_for: Linux-x86_64-musl,
+              os: ubuntu-latest,
+              target: x86_64-unknown-linux-musl,
+              command: cross,
+            }
+          - {
+              release_for: Windows-x86_64,
+              os: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              command: cargo,
+            }
+          - {
+              release_for: macOS-aarch64,
+              os: macos-14,
+              target: aarch64-apple-darwin,
+              command: cargo,
+            }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform.target }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: "${{ matrix.platform.target }}"
+
+      - name: Setup Android NDK
+        if: matrix.platform.command == 'ndk'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Install Build Tools
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform.command }}" == "ndk" ]; then
+            cargo install cargo-ndk
+          elif [ "${{ matrix.platform.command }}" == "cross" ]; then
+            cargo install cross --git https://github.com/cross-rs/cross
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform.command }}" == "ndk" ]; then
+            # Android: 只编译库，禁用默认 feature 从而避开 cli 相关依赖
+            cargo ndk -t ${{ matrix.platform.abi }} build --release --lib --no-default-features
+          elif [ "${{ matrix.platform.command }}" == "cross" ]; then
+            cross build --release --target ${{ matrix.platform.target }} --features cli
+          else
+            cargo build --release --target ${{ matrix.platform.target }} --features cli
+          fi
+
+      - name: Package Assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.platform.command }}" == "ndk" ]; then
+            # 仅拷贝 Android .so 库
+            SRC="target/${{ matrix.platform.target }}/release/lib${{ env.LIB_NAME }}.so"
+            DST="dist/lib${{ env.LIB_NAME }}-${{ matrix.platform.abi }}.so"
+            cp "$SRC" "$DST"
+          else
+            # 拷贝桌面端 CLI
+            EXT=""
+            if [ "${{ matrix.platform.os }}" == "windows-latest" ]; then EXT=".exe"; fi
+            SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}$EXT"
+            DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}$EXT"
+            cp "$SRC" "$DST"
+          fi
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.release_for }}
+          path: dist/*
+          retention-days: 7
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+          generate_release_notes: true
