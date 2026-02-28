@@ -32,6 +32,7 @@ pub struct EngineContext {
 
 pub struct SharedState {
     pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    pub eplus_auth: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 // --- 辅助工具函数 ---
@@ -161,6 +162,7 @@ pub async fn start_engine_core(
 
     let shared_state = web::Data::new(SharedState {
         duration_cache: cache.clone(),
+        eplus_auth: Arc::new(tokio::sync::Mutex::new(None)),
     });
     let port = 8080u16;
 

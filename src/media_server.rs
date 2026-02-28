@@ -13,7 +13,34 @@ pub async fn proxy_handler(
     client: web::Data<reqwest::Client>,
     shared_state: web::Data<SharedState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (origin_url,) = path.into_inner();
+    let (mut origin_url,) = path.into_inner();
+    let query_string = req.query_string();
+    if !query_string.is_empty() {
+        origin_url.push('?');
+        origin_url.push_str(query_string);
+    }
+    
+    // 针对 eplus 的特殊鉴权参数保存与补全逻辑
+    if origin_url.contains("eplus") {
+        let mut session = shared_state.eplus_auth.lock().await;
+        if origin_url.contains("Policy=") && origin_url.contains("Signature=") {
+            // 如果链接带了完整鉴权参数（如 index.m3u8），保存它供后续切片使用
+            if let Some(query_start) = origin_url.find('?') {
+                *session = Some(origin_url[query_start + 1..].to_string());
+                info!("Eplus: Saved auth parameters from playlist request");
+            }
+        } else if (origin_url.ends_with(".ts") || origin_url.contains(".ts?")) && !origin_url.contains("Signature=") {
+            // 如果是切片请求（.ts）且缺少鉴权，将保存的参数拼接到切片 URL 后
+            if let Some(ref auth_params) = *session {
+                let connector = if origin_url.contains('?') { "&" } else { "?" };
+                origin_url.push_str(connector);
+                origin_url.push_str(auth_params);
+                info!("Eplus: Injected saved auth parameters into segment request");
+            }
+        }
+    }
+
+    info!("Received proxy request for URL: {}", origin_url);
     let range_hdr = req
         .headers()
         .get(actix_web::http::header::RANGE)
@@ -38,9 +65,10 @@ pub async fn proxy_handler(
     let (bv_id, page) = if is_direct {
         (origin_url.as_str(), None)
     } else {
-        let bv_id = &origin_url[..origin_url.find('-').unwrap_or(origin_url.len())];
-        let page: Option<u32> = if let Some(pos) = origin_url.find("-page") {
-            origin_url[pos + 5..].parse().ok()
+        let path_without_query = origin_url.split('?').next().unwrap_or(origin_url.as_str());
+        let bv_id = &path_without_query[..path_without_query.find('-').unwrap_or(path_without_query.len())];
+        let page: Option<u32> = if let Some(pos) = path_without_query.find("-page") {
+            path_without_query[pos + 5..].parse().ok()
         } else {
             None
         };
@@ -59,34 +87,60 @@ pub async fn proxy_handler(
 
     info!("Proxy resolved target_url={}", target_url);
 
-    // 异步获取视频时长并存入缓存
-    let duration_cache = shared_state.duration_cache.clone();
-    let origin_url_clone = origin_url.clone();
-    let target_url_clone = target_url.clone();
-    tokio::spawn(async move {
-        // 先检查缓存中是否已有该视频的时长
-        {
-            let cache = duration_cache.lock().await;
-            if cache.contains_key(&origin_url_clone) {
-                return;
-            }
-        }
+    // 异步获取视频时长并存入缓存（m3u8 直播流跳过，为了避免抓取 HLS 分片时产生大量无用且失败的网络请求，直接地址也需要跳过对 ts/m4s/fmp4 分片或带有结尾查询串切片的探测）
+    let is_hls = origin_url
+        .split('?')
+        .next()
+        .is_some_and(|url| url.ends_with(".m3u8"))
+        || target_url
+            .split('?')
+            .next()
+            .is_some_and(|url| url.ends_with(".m3u8"));
 
-        match get_mp4_duration(&target_url_clone).await {
-            Ok(duration) => {
+    // 对于 HLS 或者是显然属于 FMP4 / HLS segment 的分片文件，避免去请求其时长
+    let is_segment = origin_url.contains("fmp4") 
+        || origin_url.contains(".m4s") 
+        || origin_url.contains(".ts")
+        || (is_direct && req.headers().contains_key(actix_web::http::header::RANGE) && !range_hdr.starts_with("bytes=0-"));
+        
+    if !is_hls && !is_segment {
+        let duration_cache = shared_state.duration_cache.clone();
+        let origin_url_clone = origin_url.clone();
+        let target_url_clone = target_url.clone();
+        tokio::spawn(async move {
+            // 先检查缓存中是否已有该视频的时长，若无则先用 0 占位，防止并发产生大量多余下载请求
+            {
                 let mut cache = duration_cache.lock().await;
-                cache.insert(origin_url_clone, duration.as_secs() as u32);
-                info!(
-                    "成功获取并缓存视频时长: {} -> {}s",
-                    target_url_clone,
-                    duration.as_secs()
-                );
+                if cache.contains_key(&origin_url_clone) {
+                    return;
+                }
+                cache.insert(origin_url_clone.clone(), 0);
             }
-            Err(e) => {
-                log::warn!("无法获取视频时长: {}", e);
+
+            match get_mp4_duration(&target_url_clone).await {
+                Ok(duration) => {
+                    let mut cache = duration_cache.lock().await;
+                    cache.insert(origin_url_clone, duration.as_secs() as u32);
+                    info!(
+                        "成功获取并缓存视频时长: {} -> {}s",
+                        target_url_clone,
+                        duration.as_secs()
+                    );
+                }
+                Err(e) => {
+                    let mut cache = duration_cache.lock().await;
+                    cache.insert(origin_url_clone, 0); // 缓存失败结果，避免后续 HLS 分片反复请求下载 2MB
+                    if is_direct {
+                        log::debug!("无法获取(直链/分片)视频时长: {} (静默跳过并缓存为0)", e);
+                    } else {
+                        log::warn!("无法获取 bilibili 视频时长: {}", e);
+                    }
+                }
             }
-        }
-    });
+        });
+    } else {
+        info!("检测到 m3u8 等切片或直播流，跳过时长解析: {}", target_url);
+    }
 
     // DLNA renderers often probe with HEAD and/or send Range requests.
     let mut upstream = match *req.method() {
@@ -94,9 +148,27 @@ pub async fn proxy_handler(
         _ => client.get(&target_url),
     };
 
-    upstream = upstream
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36")
-        .header("Referer", "https://www.bilibili.com/");
+    if target_url.contains("eplus") {
+        upstream = upstream
+            .header("accept", "*/*")
+            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .header("cache-control", "no-cache")
+            .header("origin", "https://live.nulla.top")
+            .header("pragma", "no-cache")
+            .header("priority", "u=1, i")
+            .header("sec-ch-ua", "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")
+            .header("sec-ch-ua-mobile", "?1")
+            .header("sec-ch-ua-platform", "\"iOS\"")
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "cross-site")
+            .header("user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1");
+    } else {
+        upstream = upstream
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36")
+            .header("Referer", "https://www.bilibili.com/");
+    }
+        
 
     // Forward Range-related headers to support seek/probe.
     if let Some(range) = req.headers().get(actix_web::http::header::RANGE) {

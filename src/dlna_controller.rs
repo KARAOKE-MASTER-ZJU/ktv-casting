@@ -436,7 +436,14 @@ impl DlnaController {
         // If caller didn't provide metadata, generate a minimal DIDL-Lite for compatibility.
         let metadata = if current_uri_metadata.trim().is_empty() {
             // Title can be anything; devices often only care about protocolInfo.
-            build_didl_lite_metadata(current_uri, &media_url, None)
+            let protocol_info = if current_uri.contains(".m3u8") {
+                log::info!("检测到HLS流，使用宽松的协议描述以提高兼容性");
+                Some("http-get:*:application/vnd.apple.mpegurl:*")
+            }else{
+                None
+            };
+            log::info!("没有提供元数据，正在生成默认的DIDL-Lite元数据...");
+            build_didl_lite_metadata(current_uri, &media_url, protocol_info)
         } else {
             current_uri_metadata.to_string()
         };

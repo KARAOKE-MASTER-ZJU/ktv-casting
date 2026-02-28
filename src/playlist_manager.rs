@@ -93,7 +93,10 @@ impl PlaylistManager {
             // 提取 bilibili://video/ 后面的部分
             if let Some(start) = url.find("bilibili://video/") {
                 let after_prefix = &url[start + "bilibili://video/".len()..];
-                after_prefix.to_string().replace("?", "-").replace("=", "") // 替换问号和等号，避免DLNA设备不支持
+                after_prefix.to_string().replace("?", "-").replace("=", "") // 保持原有 bilibili 逻辑
+            } else if url.starts_with("http") {
+                // 如果是直接链接（如 eplus），不做任何替换，保持完整参数
+                url.to_string()
             } else {
                 url.to_string().replace("?", "-").replace("=", "")
             }
