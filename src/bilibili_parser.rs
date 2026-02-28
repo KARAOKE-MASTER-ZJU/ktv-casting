@@ -13,6 +13,11 @@ pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<
     let client = Client::new();
     let page = page.unwrap_or(0);
 
+    //如果bv_id本来就是一个URL，直接返回
+    if bv_id.starts_with("http") {
+        return Ok(bv_id.to_string());
+    }
+
     // 第一步：获取CID
     let cid = get_video_cid(&client, bv_id, page).await?;
 

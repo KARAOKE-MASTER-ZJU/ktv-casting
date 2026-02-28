@@ -34,18 +34,28 @@ pub async fn proxy_handler(
         if_range_hdr
     );
 
-    let bv_id = &origin_url[..origin_url.find('-').unwrap_or(origin_url.len())];
-    let page: Option<u32> = if let Some(pos) = origin_url.find("-page") {
-        origin_url[pos + 5..].parse().ok()
+    let is_direct = origin_url.starts_with("http://") || origin_url.starts_with("https://");
+    let (bv_id, page) = if is_direct {
+        (origin_url.as_str(), None)
     } else {
-        None
+        let bv_id = &origin_url[..origin_url.find('-').unwrap_or(origin_url.len())];
+        let page: Option<u32> = if let Some(pos) = origin_url.find("-page") {
+            origin_url[pos + 5..].parse().ok()
+        } else {
+            None
+        };
+        (bv_id, page)
     };
 
     info!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
 
-    let target_url = get_bilibili_direct_link(bv_id, page)
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let target_url = if is_direct {
+        origin_url.clone()
+    } else {
+        get_bilibili_direct_link(bv_id, page)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?
+    };
 
     info!("Proxy resolved target_url={}", target_url);
 
