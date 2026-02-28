@@ -4,12 +4,12 @@ use crossterm::event::{self};
 use crossterm::terminal;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
-use ktv_casting_lib::{ENGINE_STATE, start_engine_core, toggle_pause_core, trigger_next_song, jump_to_secs};
-use log::{Log, Metadata, Record, info, error};
+use ktv_casting_lib::{ENGINE_STATE, start_engine_core, toggle_pause_core, trigger_next_song};
+use log::{Log, Metadata, Record, info};
 use std::fmt::Write;
 use std::io;
 use std::time::Duration;
-use url::{Position, Url};
+use url::Url;
 
 struct ProgressLogger {
     inner: Box<dyn Log>,
@@ -176,11 +176,18 @@ fn get_room_config_interactively() -> Result<(String, String)> {
 
     let mut normalized = url_str.to_string();
     if !normalized.contains("://") && !normalized.is_empty() {
-        normalized = format!("http://{}", normalized);
+        normalized = format!("https://{}", normalized);
     }
 
-    let parsed = Url::parse(&normalized).with_context(|| "无法解析 URL")?;
-    let base_url = parsed[..Position::AfterPort].to_string();
+    let parsed = Url::parse(&normalized).with_context(|| format!("无法解析 URL: {}", normalized))?;
+    
+    // 提取 base_url (协议 + 域名 + 端口)
+    let base_url = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+    let base_url = if let Some(port) = parsed.port() {
+        format!("{}:{}", base_url, port)
+    } else {
+        base_url
+    };
 
     let room_str = parsed
         .query_pairs()
@@ -194,7 +201,9 @@ fn get_room_config_interactively() -> Result<(String, String)> {
                 .map(|s| s.to_string())
         })
         .with_context(|| "URL 中未找到房间号")?;
-    Ok((base_url, room_str.to_string()))
+    
+    info!("解析成功: BaseURL={}, RoomID={}", base_url, room_str);
+    Ok((base_url, room_str))
 }
 
 /// 负责进度查询、自动切歌，并通过回调更新 UI
