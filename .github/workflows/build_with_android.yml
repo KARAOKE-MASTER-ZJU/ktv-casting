@@ -6,7 +6,7 @@ permissions:
 on:
   push:
     branches: ["android-app", "main"]
-    tags: ["starfx-v*"]
+    tags: ["v*"]
   pull_request:
     branches: ["android-app"]
 
@@ -145,3 +145,10 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+      
+      - name: Trigger Android App Build #通过 Repository Dispatch 事件通知 Android App 仓库进行更新
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.APP_REPO_TOKEN }}
+          repository: birchtree2/ktv-casting-android-app
+          event-type: rust-lib-updated
