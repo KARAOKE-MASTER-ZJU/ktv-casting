@@ -162,3 +162,4 @@ jobs:
           #跨仓库，需要申请PAT(Personal Access Token)，并设置权限为repo，最后将Token添加到当前仓库的Secrets中
           repository: birchtree2/ktv-casting-android-app
           event-type: rust-lib-updated
+          client-payload: '{"version": "${{ github.ref_name }}"}'
