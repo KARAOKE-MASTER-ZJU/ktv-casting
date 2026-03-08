@@ -5,7 +5,7 @@ permissions:
 
 on:
   push:
-    branches: ["android-app", "main"]
+    # branches: ["android-app", "main"] 只有打tag才会触发构建，避免频繁触发
     tags: ["v*"]
   pull_request:
     branches: ["android-app"]
