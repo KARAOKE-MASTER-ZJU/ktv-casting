@@ -1,15 +1,17 @@
 #[allow(non_snake_case)]
 use crate::ENGINE_STATE;
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JString};
 use jni::sys::{jint, jobjectArray, jsize, jstring, jintArray};
-use log::info;
+use jni::JavaVM;
+use log::{info, Log, Metadata, Record};
+use std::sync::OnceLock;
 
 // 1. 日志初始化
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
-    _env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     level: jint,
 ) {
@@ -19,15 +21,98 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
         2 => log::LevelFilter::Info,
         _ => log::LevelFilter::Debug,
     };
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log_level)
-            .with_tag("RUST_KTV"),
-    );
+    let _ = init_jni_log_bridge(&env);
+    let logger = JniLogger::new(android_logger::Config::default()
+        .with_max_level(log_level)
+        .with_tag("RUST_KTV"));
+    let _ = log::set_boxed_logger(Box::new(logger))
+        .map(|()| log::set_max_level(log_level));
     // 顺便把 Crypto 也初始化
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     info!("Android 日志与 Crypto 模块初始化完成");
+}
+
+struct LogBridge {
+    java_vm: JavaVM,
+    rust_engine_class: GlobalRef,
+}
+
+static LOG_BRIDGE: OnceLock<LogBridge> = OnceLock::new();
+
+fn init_jni_log_bridge(env: &JNIEnv) -> Result<(), String> {
+    if LOG_BRIDGE.get().is_some() {
+        return Ok(());
+    }
+
+    let java_vm = env.get_java_vm().map_err(|e| format!("get_java_vm failed: {e}"))?;
+    let rust_engine_local = env
+        .find_class("zju/bangdream/ktv/casting/RustEngine")
+        .map_err(|e| format!("find_class failed: {e}"))?;
+    let rust_engine_class = env
+        .new_global_ref(rust_engine_local)
+        .map_err(|e| format!("new_global_ref failed: {e}"))?;
+
+    LOG_BRIDGE
+        .set(LogBridge {
+            java_vm,
+            rust_engine_class,
+        })
+        .map_err(|_| "LOG_BRIDGE already initialized".to_string())?;
+
+    Ok(())
+}
+
+struct JniLogger {
+    inner: android_logger::Logger,
+}
+
+impl JniLogger {
+    fn new(config: android_logger::Config) -> Self {
+        Self {
+            inner: android_logger::Logger::new(config),
+        }
+    }
+}
+
+impl Log for JniLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        self.inner.log(record);
+
+        let Some(bridge) = LOG_BRIDGE.get() else { return; };
+        let level = match record.level() {
+            log::Level::Trace => 0,
+            log::Level::Debug => 1,
+            log::Level::Info => 2,
+            log::Level::Warn => 3,
+            log::Level::Error => 4,
+        };
+        let target = record.target();
+        let message = format!("{}", record.args());
+
+        if let Ok(env) = bridge.java_vm.attach_current_thread() {
+            let Ok(target_j) = env.new_string(target) else { return; };
+            let Ok(message_j) = env.new_string(message) else { return; };
+            let _ = env.call_static_method(
+                bridge.rust_engine_class.as_obj(),
+                "onRustLog",
+                "(ILjava/lang/String;Ljava/lang/String;)V",
+                &[level.into(), (&target_j).into(), (&message_j).into()],
+            );
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
 }
 
 // 2. 搜索接口
