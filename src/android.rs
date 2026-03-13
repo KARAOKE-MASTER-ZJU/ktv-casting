@@ -101,8 +101,8 @@ impl Log for JniLogger {
             let Ok(target_j) = env.new_string(target) else { return; };
             let Ok(message_j) = env.new_string(message) else { return; };
 
-            // 使用 JClass::from 将 GlobalRef 的对象转换为 JClass 描述符
-            let cls = JClass::from(bridge.rust_engine_class.as_obj());
+            // 从 GlobalRef 借用 JClass 描述符（避免临时对象转换错误）
+            let cls = <&JClass>::from(bridge.rust_engine_class.as_obj());
             let _ = env.call_static_method(
                 cls,
                 "onRustLog",
@@ -117,7 +117,7 @@ impl Log for JniLogger {
     }
 
     fn flush(&self) {
-        self.inner.flush();
+        // no-op: 当前 logger 不维护额外的缓冲区
     }
 }
 
