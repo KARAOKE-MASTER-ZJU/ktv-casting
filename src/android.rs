@@ -1,7 +1,7 @@
 #[allow(non_snake_case)]
 use crate::ENGINE_STATE;
 use jni::JNIEnv;
-use jni::objects::{GlobalRef, JClass, JObject, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jint, jobjectArray, jsize, jstring, jintArray};
 use jni::JavaVM;
 use log::{info, Log, Metadata, Record};
@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     level: jint,
 ) {
@@ -21,12 +21,13 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
         2 => log::LevelFilter::Info,
         _ => log::LevelFilter::Debug,
     };
-    let _ = init_jni_log_bridge(&env);
-    let logger = JniLogger::new(android_logger::Config::default()
-        .with_max_level(log_level)
-        .with_tag("RUST_KTV"));
-    let _ = log::set_boxed_logger(Box::new(logger))
-        .map(|()| log::set_max_level(log_level));
+
+    let _ = init_jni_log_bridge(&mut env);
+
+    // 注册我们的 JNI logger（将 Rust 日志转发到 Java），这是全局唯一的 logger
+    let _ = log::set_boxed_logger(Box::new(JniLogger::new()));
+    log::set_max_level(log_level);
+
     // 顺便把 Crypto 也初始化
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -40,7 +41,7 @@ struct LogBridge {
 
 static LOG_BRIDGE: OnceLock<LogBridge> = OnceLock::new();
 
-fn init_jni_log_bridge(env: &JNIEnv) -> Result<(), String> {
+fn init_jni_log_bridge(env: &mut JNIEnv) -> Result<(), String> {
     if LOG_BRIDGE.get().is_some() {
         return Ok(());
     }
@@ -64,28 +65,27 @@ fn init_jni_log_bridge(env: &JNIEnv) -> Result<(), String> {
 }
 
 struct JniLogger {
-    inner: android_logger::Logger,
+    // minimal; 直接把日志转发到 Java，必要时也可以扩展把日志写到其他地方
 }
 
 impl JniLogger {
-    fn new(config: android_logger::Config) -> Self {
-        Self {
-            inner: android_logger::Logger::new(config),
-        }
+    fn new() -> Self {
+        Self {}
     }
 }
 
 impl Log for JniLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        self.inner.enabled(metadata)
+        // 开发时把所有级别都允许，让 log::set_max_level 控制最终输出
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
-
-        self.inner.log(record);
+        // 把日志也打印到 stderr（便于非 Android 平台和调试）
+        eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
 
         let Some(bridge) = LOG_BRIDGE.get() else { return; };
         let level = match record.level() {
@@ -97,15 +97,21 @@ impl Log for JniLogger {
         };
         let target = record.target();
         let message = format!("{}", record.args());
-
         if let Ok(env) = bridge.java_vm.attach_current_thread() {
             let Ok(target_j) = env.new_string(target) else { return; };
             let Ok(message_j) = env.new_string(message) else { return; };
+
+            // 使用 JClass::from 将 GlobalRef 的对象转换为 JClass 描述符
+            let cls = JClass::from(bridge.rust_engine_class.as_obj());
             let _ = env.call_static_method(
-                bridge.rust_engine_class.as_obj(),
+                cls,
                 "onRustLog",
                 "(ILjava/lang/String;Ljava/lang/String;)V",
-                &[level.into(), (&target_j).into(), (&message_j).into()],
+                &[
+                    JValue::from(level as jint),
+                    JValue::from(&target_j),
+                    JValue::from(&message_j),
+                ],
             );
         }
     }
