@@ -97,7 +97,7 @@ impl Log for JniLogger {
         };
         let target = record.target();
         let message = format!("{}", record.args());
-        if let Ok(env) = bridge.java_vm.attach_current_thread() {
+        if let Ok(mut env) = bridge.java_vm.attach_current_thread() {
             let Ok(target_j) = env.new_string(target) else { return; };
             let Ok(message_j) = env.new_string(message) else { return; };
 
