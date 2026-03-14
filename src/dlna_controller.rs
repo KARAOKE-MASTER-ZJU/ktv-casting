@@ -673,7 +673,7 @@ impl DlnaController {
         let current_secs = current_time.num_seconds_from_midnight();
         let total_secs = total_time.num_seconds_from_midnight();
 
-        Ok((current_secs, total_secs))
+        Ok((current_secs, 36000)) //模拟设备没有正确返回总时长，暂时固定为10小时（36000秒），以避免除以0或其他错误
     }
 
     // 设置播放进度（跳转到指定秒数）

@@ -74,10 +74,28 @@ pub async fn get_current_progress() -> (i32, i32) {
         if let Some(ctx) = guard.as_ref() {
             return match ctx.controller.get_secs(&ctx.device).await {
                 Ok((curr, total)) => {
-                    let cached_total=get_total_duration().await;
+                    let cached_total = get_total_duration().await;
+                    let playing = ctx.playlist_manager.get_song_playing().await;
+                    info!(
+                        "progress: curr={} total={} cached_total={} playing={:?}",
+                        curr,
+                        total,
+                        cached_total,
+                        playing
+                    );
                     if cached_total > 0 && cached_total != total {
+                        info!(
+                            "progress: override device total {} -> cached {}",
+                            total,
+                            cached_total
+                        );
                         (curr as i32, cached_total as i32)
-                    }else{
+                    } else {
+                        info!(
+                            "progress: keep device total {} (cached_total={})",
+                            total,
+                            cached_total
+                        );
                         (curr as i32, total as i32)
                     }
                     
