@@ -1,7 +1,7 @@
 use crate::dlna_controller::{DlnaController, DlnaDevice};
 use crate::playlist_manager::PlaylistManager;
 use actix_web::{App, HttpServer, web};
-use log::info;
+use log::{info, debug};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock}; // 改用 RwLock 以支持重置
@@ -76,7 +76,7 @@ pub async fn get_current_progress() -> (i32, i32) {
                 Ok((curr, total)) => {
                     let cached_total = get_total_duration().await;
                     let playing = ctx.playlist_manager.get_song_playing().await;
-                    info!(
+                    debug!(
                         "progress: curr={} total={} cached_total={} playing={:?}",
                         curr,
                         total,
@@ -84,14 +84,14 @@ pub async fn get_current_progress() -> (i32, i32) {
                         playing
                     );
                     if cached_total > 0 && cached_total != total {
-                        info!(
+                        debug!(
                             "progress: override device total {} -> cached {}",
                             total,
                             cached_total
                         );
                         (curr as i32, cached_total as i32)
                     } else {
-                        info!(
+                        debug!(
                             "progress: keep device total {} (cached_total={})",
                             total,
                             cached_total
@@ -141,7 +141,7 @@ pub async fn start_engine_core(
     room_id: String,
     loc_str: String,
     rt: tokio::runtime::Runtime,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     info!("开始初始化核心引擎: {}, Room: {}", loc_str, room_id);
 
@@ -151,11 +151,29 @@ pub async fn start_engine_core(
             info!("检测到旧引擎正在运行，正在重置以连接新设备...");
             *guard = None;
             // 给系统时间释放端口
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     }
 
-    // B. 初始化新运行时
+    // B. 连接DLNA设备
+    let handle = rt.handle().clone();
+    let (controller, device, local_ip_addr, port, cache, _shared_state) = connect_dlna_device(loc_str, handle).await?;
+
+    // C. 连接房间
+    connect_room(base_url_str, room_id, controller, device, local_ip_addr, port, cache, rt).await?;
+
+    info!("Rust Engine 已重新初始化，设备连接成功");
+    Ok(())
+}
+
+/// 连接DLNA设备
+pub async fn connect_dlna_device(
+    loc_str: String,
+    handle: tokio::runtime::Handle,
+) -> Result<(DlnaController, DlnaDevice, std::net::IpAddr, u16, Arc<Mutex<std::collections::HashMap<String, u32>>>, web::Data<SharedState>), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    info!("开始连接DLNA设备: {}", loc_str);
+
     let controller = DlnaController::new();
     let uri = loc_str.parse().expect("解析 URL 失败");
     let device_obj = rupnp::Device::from_url(uri).await.expect("连接设备失败");
@@ -175,7 +193,6 @@ pub async fn start_engine_core(
 
     info!("目标设备 IP 地址: {}", target_ip);
 
-    let pm = PlaylistManager::new(&base_url_str, room_id);
     let cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let shared_state = web::Data::new(SharedState {
@@ -184,23 +201,43 @@ pub async fn start_engine_core(
     });
     let port = 8080u16;
 
-    // 启动 HttpServer (使用当前 Runtime 的 spawn)
-    tokio::spawn(async move {
+    // 启动 HttpServer (使用提供的 handle)
+    let shared_state_clone = shared_state.clone();
+    handle.spawn(async move {
         info!("正在启动媒体服务器...");
-        let _ = HttpServer::new(move || {
+        let app_factory = move || {
             App::new()
                 .app_data(web::Data::new(reqwest::Client::new()))
-                .app_data(shared_state.clone())
+                .app_data(shared_state_clone.clone())
                 .service(media_server::proxy_handler)
-        })
-        .workers(1)
-        .bind(("0.0.0.0", port))
-        .unwrap()
-        .run()
-        .await;
+        };
+        let _ = HttpServer::new(app_factory)
+            .workers(1)
+            .bind(("0.0.0.0", port))
+            .unwrap()
+            .run()
+            .await;
     });
 
     let local_ip_addr: std::net::IpAddr = get_best_local_ip(target_ip).parse().unwrap();
+
+    Ok((controller, device, local_ip_addr, port, cache, shared_state))
+}
+
+/// 连接房间
+pub async fn connect_room(
+    base_url_str: String,
+    room_id: String,
+    controller: DlnaController,
+    device: DlnaDevice,
+    local_ip_addr: std::net::IpAddr,
+    port: u16,
+    cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    rt: tokio::runtime::Runtime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("开始连接房间: {}", room_id);
+
+    let pm = PlaylistManager::new(&base_url_str, room_id);
 
     // 配置同步回调
     let ctrl_sync = controller.clone();
@@ -219,7 +256,7 @@ pub async fn start_engine_core(
         })
     });
 
-    // C. 打包存入全局状态
+    // 打包存入全局状态
     let ctx = Arc::new(EngineContext {
         controller,
         device,
@@ -233,8 +270,10 @@ pub async fn start_engine_core(
 
     if let Ok(mut guard) = ENGINE_STATE.write() {
         *guard = Some(ctx);
-        info!("Rust Engine 已重新初始化，设备连接成功");
+        info!("房间连接成功");
     }
+
+    Ok(())
 }
 
 // 获取当前歌曲总时长

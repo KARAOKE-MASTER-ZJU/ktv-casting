@@ -168,6 +168,9 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
     let room_id_str: String = env.get_string(&room_id).unwrap().into();
 
     std::thread::spawn(move || {
+        // 启动前先尝试清理旧状态，防止冲突
+        crate::reset_engine();
+
         // 创建 Runtime
         let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -175,7 +178,10 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startEngine(
         // 我们需要把 rt 的所有权传给 start_engine_core，所以这里用 handle 来 block_on
         let handle = rt.handle().clone();
         handle.block_on(async {
-            crate::start_engine_core(base_url_str, room_id_str, loc_str, rt).await;
+            // 使用 match 代替 expect，防止 panic 污染全局锁
+            if let Err(e) = crate::start_engine_core(base_url_str, room_id_str, loc_str, rt).await {
+                log::error!("Failed to start engine: {}", e);
+            }
         });
     });
 }
@@ -333,5 +339,3 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getCurrentSongTitle(
         .expect("Couldn't create java string!")
         .into_raw()
 }
-
-

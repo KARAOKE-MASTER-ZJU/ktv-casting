@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     let engine_rt = tokio::runtime::Runtime::new().context("Failed to create engine runtime")?;
 
     // 3. 启动引擎逻辑 (调用 lib.rs 中的异步函数)
-    start_engine_core(base_url, room_id, device.location.clone(), engine_rt).await;
+    start_engine_core(base_url, room_id, device.location.clone(), engine_rt).await.expect("Failed to start engine");
 
     pb.set_draw_target(ProgressDrawTarget::stdout());
 
