@@ -331,12 +331,20 @@ pub async fn get_volume_core() -> Result<u32, Box<dyn std::error::Error>> {
     Ok(v)
 }
 
-// 搜索设备
+// 搜索设备（多播SSDP）
 pub async fn discover_devices_core() -> Vec<DlnaDevice> {
     DlnaController::new()
         .discover_devices()
         .await
         .unwrap_or_default()
+}
+
+/// 通过设备描述XML的URL直接获取设备（适用于WiFi不支持多播的场景）
+pub async fn discover_device_from_url_core(url: String) -> Result<DlnaDevice, String> {
+    DlnaController::new()
+        .get_device_from_url(&url)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 获取当前正在播放的歌曲标题
