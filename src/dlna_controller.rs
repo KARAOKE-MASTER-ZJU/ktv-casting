@@ -405,6 +405,29 @@ impl DlnaController {
         Ok(dlna_devices)
     }
 
+    /// 通过设备描述XML的URL直接获取设备（无需多播，适用于不支持SSDP的WiFi环境）
+    pub async fn get_device_from_url(&self, url: &str) -> Result<DlnaDevice, rupnp::Error> {
+        let uri: Uri = url
+            .parse()
+            .map_err(|_| rupnp::Error::ParseError("无法解析设备XML URL"))?;
+        log::info!("正在通过URL直接获取设备: {}", url);
+        let device = Device::from_url(uri).await?;
+        let friendly_name = device.friendly_name().to_string();
+        let location = device.url().to_string();
+        let services = device
+            .services()
+            .iter()
+            .map(|s| s.service_type().clone())
+            .collect();
+        log::info!("通过URL成功获取设备: {} ({})", friendly_name, location);
+        Ok(DlnaDevice {
+            device,
+            friendly_name,
+            location,
+            services,
+        })
+    }
+
     // 获取设备的AVTransport服务
     fn get_avtransport_service<'a>(&'a self, device: &'a DlnaDevice) -> Option<&'a rupnp::Service> {
         device
