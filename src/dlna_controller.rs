@@ -1,5 +1,6 @@
 use chrono::{NaiveTime, Timelike};
-use futures::future::try_join_all;
+use futures::future::join_all;
+use tokio::time::timeout;
 use futures::stream::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rupnp::Device;
@@ -383,14 +384,27 @@ impl DlnaController {
         &self,
         urls: &Vec<&'static str>,
     ) -> Result<Vec<DlnaDevice>, rupnp::Error> {
-        let devices = try_join_all(urls.iter().map(|url| {
-            let uri = Uri::from_static(url);
-            Device::from_url(uri)
-        }))
-        .await?;
+        let tasks = urls.iter().map(|url| {
+            let uri =Uri::from_static(url);
+            async move {
+                match timeout(Duration::from_secs(3), Device::from_url(uri)).await {
+                    Ok(Ok(device)) => Some(device), // 成功获取
+                    Ok(Err(e)) => {
+                        log::error!("解析 URL 失败 [{}]: {}", url, e);
+                        None
+                    }
+                    Err(_) => {
+                        log::warn!("请求 URL 超时 [{}], 判定设备不在线", url);
+                        None
+                    }
+                }
+            }
+        });
 
-        let dlna_devices: Vec<DlnaDevice> = devices
+        let results = join_all(tasks).await;
+        let dlna_devices: Vec<DlnaDevice> = results
             .into_iter()
+            .flatten()
             .map(|device| DlnaDevice {
                 device: device.clone(),
                 friendly_name: device.friendly_name().to_string(),
@@ -411,7 +425,11 @@ impl DlnaController {
             .parse()
             .map_err(|_| rupnp::Error::ParseError("无法解析设备XML URL"))?;
         log::info!("正在通过URL直接获取设备: {}", url);
-        let device = Device::from_url(uri).await?;
+
+        let device = timeout(Duration::from_secs(3), Device::from_url(uri))
+            .await
+            .map_err(|_| rupnp::Error::ParseError("连接设备或获取描述文件超时"))??;
+
         let friendly_name = device.friendly_name().to_string();
         let location = device.url().to_string();
         let services = device
