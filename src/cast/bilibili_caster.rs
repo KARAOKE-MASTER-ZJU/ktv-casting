@@ -344,8 +344,14 @@ impl Caster for BilibiliCaster {
             self.progress.start(duration).await;
         }
 
-        let extra = serde_json::json!({ "oid": aid, "cid": cid, "type": 101 });
-        log::info!("[Bilibili] sending play command: aid={}, cid={}, extra={}", aid, cid, extra);
+        // 对于非第一页的视频，只传cid而不传oid，让API按cid而不是oid来获取
+        let extra = if page != 0 {
+            log::info!("[Bilibili] page != 0, only sending cid (not oid) for multi-page video");
+            serde_json::json!({ "cid": cid, "type": 101 })
+        } else {
+            serde_json::json!({ "oid": aid, "cid": cid, "type": 101 })
+        };
+        log::info!("[Bilibili] sending play command: aid={}, cid={}, page={}, extra={}", aid, cid, page, extra);
         self.send_cmd(1, aid, Some(extra), 0).await
     }
 
