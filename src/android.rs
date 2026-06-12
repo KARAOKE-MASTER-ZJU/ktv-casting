@@ -43,7 +43,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initSessionDir(
     dir_path: JString,
 ) {
     let dir_str = match env.get_string(&dir_path) {
-        Ok(s) => String::from(&s),
+        Ok(s) => s.into(),
         Err(_) => String::new(),
     };
     if !dir_str.is_empty() {
