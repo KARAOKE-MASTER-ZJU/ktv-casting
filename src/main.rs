@@ -3,8 +3,11 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::{self};
 use crossterm::terminal;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
+use ktv_casting_lib::cast::bilibili_caster::{self as bili, BilibiliSession};
 use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
-use ktv_casting_lib::{ENGINE_STATE, start_engine_core, toggle_pause_core, trigger_next_song};
+use ktv_casting_lib::{
+    ENGINE_STATE, start_bilibili_engine_core, start_engine_core, toggle_pause_core, trigger_next_song,
+};
 use log::{Log, Metadata, Record, info};
 use std::fmt::Write;
 use std::io;
@@ -36,27 +39,49 @@ impl Log for ProgressLogger {
 async fn main() -> Result<()> {
     let pb = setup_env();
 
-    // 1. 交互式获取配置
+    // 1. 选择投屏模式
     let (base_url, room_id) = get_room_config_interactively()?;
-    let controller = DlnaController::new();
-    let device = select_dlna_device_interactively(&controller).await?;
 
-    // 2. 准备 Runtime 传给引擎
-    let engine_rt = tokio::runtime::Runtime::new().context("Failed to create engine runtime")?;
+    println!("选择投屏模式：");
+    println!("  1. DLNA（局域网，需要设备支持）");
+    println!("  2. 哔哩哔哩投屏（需要登录B站账号）");
+    print!("请选择 [1/2，默认1]：");
+    io::Write::flush(&mut io::stdout())?;
+    let mut mode_input = String::new();
+    io::stdin().read_line(&mut mode_input)?;
 
-    // 3. 启动引擎逻辑 (调用 lib.rs 中的异步函数)
-    start_engine_core(base_url, room_id, device.location.clone(), engine_rt).await.expect("Failed to start engine");
+    if mode_input.trim() == "2" {
+        // --- Bilibili 模式 ---
+        // 先完成所有可能失败的操作，再创建 Runtime，避免在 async 上下文里 drop Runtime
+        let session = acquire_bilibili_session().await?;
+        info!("登录成功，UID: {}", session.mid);
+        let device_buvid = select_bilibili_device_interactively(&session).await?;
+        let engine_rt = tokio::runtime::Runtime::new().context("Failed to create engine runtime")?;
+        start_bilibili_engine_core(base_url, room_id, session, device_buvid, engine_rt)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    } else {
+        // --- DLNA 模式 ---
+        let controller = DlnaController::new();
+        let device = select_dlna_device_interactively(&controller).await?;
+        let engine_rt = tokio::runtime::Runtime::new().context("Failed to create engine runtime")?;
+        start_engine_core(base_url, room_id, device.location.clone(), engine_rt)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
 
     pb.set_draw_target(ProgressDrawTarget::stdout());
-
-    // 4. 键盘监听处理
+    println!("─────────────────────────────────────────");
+    println!("  p      暂停 / 继续");
+    println!("  n      切下一首");
+    println!("  + / =  音量 +5");
+    println!("  -      音量 -5");
+    println!("  Ctrl-C 退出");
+    println!("─────────────────────────────────────────");
     spawn_keyboard_handler();
 
-    // 5. 调用封装好的监控函数，传入回调更新进度条
     let pb_for_len = pb.clone();
     let pb_for_pos = pb.clone();
-
-    // 这是一个异步死循环，会在这里持续运行直到引擎关闭或报错
     run_cli_monitor(
         move |total| pb_for_len.set_length(total),
         move |curr| pb_for_pos.set_position(curr),
@@ -64,6 +89,45 @@ async fn main() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+async fn acquire_bilibili_session() -> Result<BilibiliSession> {
+    if let Some(session) = bili::load_session() {
+        println!("已读取保存的B站会话 (UID: {})", session.mid);
+        return Ok(session);
+    }
+    println!("未找到保存的会话，启动扫码登录...");
+    let session = bili::login_qr(|qr_url| {
+        println!("\n请用B站App扫描二维码登录：");
+        let _ = qr2term::print_qr(&qr_url);
+        println!("等待扫码...");
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("B站登录失败: {}", e))?;
+    Ok(session)
+}
+
+async fn select_bilibili_device_interactively(session: &BilibiliSession) -> Result<String> {
+    let devices = bili::list_devices(session)
+        .await
+        .map_err(|e| anyhow::anyhow!("获取设备列表失败: {}", e))?;
+    if devices.is_empty() {
+        bail!("没有在线的投屏设备，请先在B站App上开始投屏");
+    }
+    println!("在线投屏设备：");
+    for (i, d) in devices.iter().enumerate() {
+        println!("  {}: {}", i + 1, d);
+    }
+    print!("选择设备编号：");
+    io::Write::flush(&mut io::stdout())?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let idx: usize = input.trim().parse::<usize>().context("无效编号")? - 1;
+    devices
+        .into_iter()
+        .nth(idx)
+        .map(|d| d.buvid)
+        .context("编号超出范围")
 }
 
 // --- 辅助逻辑函数 ---
@@ -267,24 +331,29 @@ where
         if let Ok(p) = ctx.caster.get_progress().await {
             let curr_u64 = p.current_secs as u64;
 
-            if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
-                let cache = ctx.duration_cache.lock().await;
-                if let Some(&total) = cache.get(&playing) {
-                    let total_u64 = total as u64;
-                    set_len(total_u64);
-                    set_pos(curr_u64);
+            // Prefer cached total (set by DLNA media server); fall back to
+            // the value from the caster itself (set by BilibiliCaster via LocalProgressTracker).
+            let total_u64 = {
+                let cached = if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
+                    *ctx.duration_cache.lock().await.get(&playing).unwrap_or(&0)
+                } else {
+                    0
+                };
+                if cached > 0 { cached as u64 } else { p.total_secs as u64 }
+            };
 
-                    if total_u64 > 0
-                        && curr_u64 > 5
-                        && total_u64 > curr_u64
-                        && (total_u64 - curr_u64) <= 2
-                    {
-                        log::info!(">> 歌曲即将结束，自动切换下一首...");
-                        drop(cache);
-                        let mut pm = ctx.playlist_manager.clone();
-                        let _ = pm.next_song().await;
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
+            if total_u64 > 0 {
+                set_len(total_u64);
+                set_pos(curr_u64);
+
+                if curr_u64 > 5
+                    && total_u64 > curr_u64
+                    && (total_u64 - curr_u64) <= 2
+                {
+                    log::info!(">> 歌曲即将结束，自动切换下一首...");
+                    let mut pm = ctx.playlist_manager.clone();
+                    let _ = pm.next_song().await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }

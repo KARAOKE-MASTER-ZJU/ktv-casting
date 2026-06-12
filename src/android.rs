@@ -358,6 +358,169 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_searchDeviceByUrl(
     }
 }
 
+// ---- Bilibili 登录 & 投屏 ----
+
+/// 启动B站扫码登录（异步后台）。登录状态通过 getBilibiliAuthState() 查询。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startBilibiliQrLogin(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    use crate::cast::bilibili_caster::login_qr;
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let result = login_qr(|qr_url| {
+                if let Ok(mut s) = BILI_AUTH_STATE.write() {
+                    *s = BiliAuthState::AwaitingScan { qr_url };
+                }
+            })
+            .await;
+            if let Ok(mut s) = BILI_AUTH_STATE.write() {
+                match result {
+                    Ok(session) => {
+                        *s = BiliAuthState::Success {
+                            access_token: session.access_token,
+                            mid: session.mid,
+                        };
+                    }
+                    Err(e) => {
+                        *s = BiliAuthState::Error(e);
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// 返回当前的扫码 URL（可用于在 Android 侧渲染二维码）。
+/// 未就绪时返回空字符串。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getBilibiliQrUrl(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+    let url = if let Ok(s) = BILI_AUTH_STATE.read() {
+        match &*s {
+            BiliAuthState::AwaitingScan { qr_url } => qr_url.clone(),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    env.new_string(url).unwrap().into_raw()
+}
+
+/// 登录状态：0=等待扫码，1=成功，-1=失败/过期，-2=未开始
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getBilibiliLoginStatus(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+    if let Ok(s) = BILI_AUTH_STATE.read() {
+        match &*s {
+            BiliAuthState::Idle => -2,
+            BiliAuthState::AwaitingScan { .. } => 0,
+            BiliAuthState::Success { .. } => 1,
+            BiliAuthState::Error(_) => -1,
+        }
+    } else {
+        -1
+    }
+}
+
+/// 列出在线的B站投屏设备，返回 JSON 字符串（数组）。
+/// 需要已登录（getBilibiliLoginStatus() == 1）。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_listBilibiliDevices(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    use crate::cast::bilibili_caster::{list_devices, BilibiliSession};
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+
+    let session = if let Ok(s) = BILI_AUTH_STATE.read() {
+        if let BiliAuthState::Success { access_token, mid } = &*s {
+            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let json = if let Some(session) = session {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(list_devices(&session)) {
+            Ok(devs) => serde_json::to_string(&devs).unwrap_or_else(|_| "[]".into()),
+            Err(e) => {
+                log::error!("listBilibiliDevices: {}", e);
+                "[]".into()
+            }
+        }
+    } else {
+        "[]".into()
+    };
+
+    env.new_string(json).unwrap().into_raw()
+}
+
+/// 启动B站投屏引擎。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startBilibiliEngine(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_url: JString,
+    room_id: JString,
+    device_buvid: JString,
+) {
+    use crate::cast::bilibili_caster::BilibiliSession;
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+
+    let base_url_str: String = env.get_string(&base_url).unwrap().into();
+    let room_id_str: String = env.get_string(&room_id).unwrap().into();
+    let buvid_str: String = env.get_string(&device_buvid).unwrap().into();
+
+    let session = if let Ok(s) = BILI_AUTH_STATE.read() {
+        if let BiliAuthState::Success { access_token, mid } = &*s {
+            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(session) = session else {
+        log::error!("startBilibiliEngine: not logged in");
+        return;
+    };
+
+    std::thread::spawn(move || {
+        crate::reset_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        handle.block_on(async {
+            if let Err(e) = crate::start_bilibili_engine_core(
+                base_url_str, room_id_str, session, buvid_str, rt,
+            )
+            .await
+            {
+                log::error!("startBilibiliEngine failed: {}", e);
+            }
+        });
+    });
+}
+
 // 12. 数据接口：获取当前歌曲标题
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
