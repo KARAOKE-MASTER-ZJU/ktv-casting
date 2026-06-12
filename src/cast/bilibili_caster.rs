@@ -137,7 +137,7 @@ pub async fn login_qr(on_qr: impl Fn(String) + Send + Sync) -> Result<BilibiliSe
                     .to_string();
                 let mid = poll["data"]["mid"].as_u64().ok_or("no mid")?;
                 let session = BilibiliSession { access_token: token, mid };
-                save_session(&session)?;
+                let _ = save_session(&session); // Android 无写权限时静默忽略
                 return Ok(session);
             }
             Some(86038) => return Err("QR code expired".into()),
