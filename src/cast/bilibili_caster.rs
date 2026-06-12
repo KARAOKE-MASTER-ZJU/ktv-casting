@@ -276,12 +276,24 @@ impl BilibiliCaster {
         let cmd_str = command.to_string();
         let seek_str = seek_ts.to_string();
         let ts_str = now_ts().to_string();
+
+        // 提取cid作为顶级参数（如果存在）
+        let cid_str = full_extra.get("cid")
+            .and_then(|v| v.as_u64())
+            .map(|c| c.to_string());
+
+        // 从extra中移除cid，避免重复传递
+        if let Some(obj) = full_extra.as_object_mut() {
+            obj.remove("cid");
+        }
+
         let extra_str = full_extra.to_string();
 
-        log::info!("[Bilibili] send_cmd: command={}, oid={}, extra={}", command, oid, extra_str);
+        log::info!("[Bilibili] send_cmd: command={}, oid={}, cid={:?}, extra={}", command, oid, cid_str, extra_str);
 
-        let body = form_body(&[
-            ("access_key", &self.access_token),
+        // 构建form参数，cid作为顶级参数（如果存在）
+        let mut params = vec![
+            ("access_key", self.access_token.as_str()),
             ("appkey", APPKEY),
             ("command", &cmd_str),
             ("ott_buvid", &self.device_buvid),
@@ -294,7 +306,14 @@ impl BilibiliCaster {
             ("mobi_app", "android"),
             ("platform", "android"),
             ("s_locale", "zh-Hans_CN"),
-        ]);
+        ];
+
+        // 如果存在cid，作为顶级参数加入
+        if let Some(ref cid) = cid_str {
+            params.insert(8, ("cid", cid.as_str()));
+        }
+
+        let body = form_body(&params);
 
         let resp: Value = bili_client()
             .post(format!("{}/x/tv/stream/cmd", API_HOST))
