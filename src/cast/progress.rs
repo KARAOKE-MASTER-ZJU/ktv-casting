@@ -24,7 +24,7 @@ impl LocalProgressTracker {
 
     pub async fn start(&self, total_secs: u32) {
         self.total_secs.store(total_secs, Ordering::Relaxed);
-        self.start_offset.store(2, Ordering::Relaxed); // +2s network delay
+        self.start_offset.store(0, Ordering::Relaxed);
         *self.started_at.lock().await = Some(Instant::now());
         *self.paused_at.lock().await = None;
     }
