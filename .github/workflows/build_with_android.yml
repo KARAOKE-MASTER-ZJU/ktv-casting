@@ -146,9 +146,34 @@ jobs:
           files: dist/*
           generate_release_notes: true
       
+  cleanup-old-artifacts:
+    name: Cleanup Old Artifacts
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Delete artifacts from previous runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+            for (const a of artifacts) {
+              if (a.workflow_run.id !== context.runId) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: a.id,
+                });
+                core.info(`Deleted artifact: ${a.name} (id=${a.id})`);
+              }
+            }
+
   dispatch-to-android:
     name: Dispatch Android App Build
-    needs: build-and-upload # 确保编译任务全部成功后才通知
+    needs: [build-and-upload, cleanup-old-artifacts] # 确保编译任务全部成功后才通知
     runs-on: ubuntu-latest
     # 限制条件：如果是 Pull Request 就不执行（防止 Secret 为空报错），仅在 Push / 打 Tag 时执行。
     # 这样既可以检查编译错误，又能确保APP仓库在正式合并后才会收到通知，拿到最新的库文件。
