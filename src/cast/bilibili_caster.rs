@@ -278,6 +278,8 @@ impl BilibiliCaster {
         let ts_str = now_ts().to_string();
         let extra_str = full_extra.to_string();
 
+        log::info!("[Bilibili] send_cmd: command={}, oid={}, extra={}", command, oid, extra_str);
+
         let body = form_body(&[
             ("access_key", &self.access_token),
             ("appkey", APPKEY),
@@ -305,7 +307,7 @@ impl BilibiliCaster {
             .await
             .map_err(|e| CastError::Device(e.to_string()))?;
 
-        log::debug!("send_cmd {} → {}", command, resp);
+        log::info!("[Bilibili] send_cmd response: command={}, code={}, message={}", command, resp["code"], resp["message"]);
 
         if resp["code"].as_i64() != Some(0) {
             Err(CastError::Device(format!(
@@ -330,14 +332,20 @@ fn parse_song_ref(s: &str) -> (String, u32) {
 impl Caster for BilibiliCaster {
     async fn play_song(&self, song: &SongRef) -> Result<(), CastError> {
         let (bvid, page) = parse_song_ref(&song.0);
+        log::info!("[Bilibili] play_song: song_ref={}, parsed bvid={}, page={}", song.0, bvid, page);
+
         let aid = bv_to_aid(&bvid);
+        log::debug!("[Bilibili] BV to AID: {} -> {}", bvid, aid);
 
         let (cid, duration) = get_page_info(&bvid, page).await.unwrap_or((0, 0));
+        log::info!("[Bilibili] get_page_info: page={} -> cid={}, duration={}", page, cid, duration);
+
         if duration > 0 {
             self.progress.start(duration).await;
         }
 
         let extra = serde_json::json!({ "oid": aid, "cid": cid, "type": 101 });
+        log::info!("[Bilibili] sending play command: aid={}, cid={}, extra={}", aid, cid, extra);
         self.send_cmd(1, aid, Some(extra), 0).await
     }
 
