@@ -344,15 +344,15 @@ impl Caster for BilibiliCaster {
             self.progress.start(duration).await;
         }
 
-        // 对于非第一页的视频，只传cid不传oid/aid，完全依赖cid来获取指定分页
-        let (cmd_oid, extra) = if page != 0 {
-            log::info!("[Bilibili] page != 0, only sending cid (no oid/aid) for multi-page video");
-            (0u64, serde_json::json!({ "cid": cid, "type": 101 }))
+        // 对于非第一页的视频，只在extra中传cid不传oid，但send_cmd仍需传aid
+        let extra = if page != 0 {
+            log::info!("[Bilibili] page != 0, only sending cid in extra (not oid) for multi-page video");
+            serde_json::json!({ "cid": cid, "type": 101 })
         } else {
-            (aid, serde_json::json!({ "oid": aid, "cid": cid, "type": 101 }))
+            serde_json::json!({ "oid": aid, "cid": cid, "type": 101 })
         };
-        log::info!("[Bilibili] sending play command: cmd_oid={}, cid={}, page={}, extra={}", cmd_oid, cid, page, extra);
-        self.send_cmd(1, cmd_oid, Some(extra), 0).await
+        log::info!("[Bilibili] sending play command: aid={}, cid={}, page={}, extra={}", aid, cid, page, extra);
+        self.send_cmd(1, aid, Some(extra), 0).await
     }
 
     async fn resume(&self) -> Result<(), CastError> {
