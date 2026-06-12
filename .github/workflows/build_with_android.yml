@@ -153,23 +153,14 @@ jobs:
     if: github.event_name != 'pull_request'
     steps:
       - name: Delete artifacts from previous runs
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const artifacts = await github.paginate(
-              github.rest.actions.listArtifactsForRepo,
-              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
-            );
-            for (const a of artifacts) {
-              if (a.workflow_run.id !== context.runId) {
-                await github.rest.actions.deleteArtifact({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  artifact_id: a.id,
-                });
-                core.info(`Deleted artifact: ${a.name} (id=${a.id})`);
-              }
-            }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 获取所有 artifacts，排除当前 run
+          gh api repos/${{ github.repository }}/actions/artifacts --paginate -q '.artifacts[] | select(.workflow_run.id != ${{ github.run_id }}) | .id' | while read artifact_id; do
+            echo "Deleting artifact: $artifact_id"
+            gh api --method DELETE repos/${{ github.repository }}/actions/artifacts/$artifact_id
+          done
 
   dispatch-to-android:
     name: Dispatch Android App Build
