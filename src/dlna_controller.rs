@@ -712,7 +712,7 @@ impl DlnaController {
             parse_time_str(duration).unwrap_or_else(|_| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
 
         let current_secs = current_time.num_seconds_from_midnight();
-        let total_secs = total_time.num_seconds_from_midnight();
+        let _total_secs = total_time.num_seconds_from_midnight();
 
         Ok((current_secs, 36000)) //模拟设备没有正确返回总时长，暂时固定为10小时（36000秒），以避免除以0或其他错误
     }
