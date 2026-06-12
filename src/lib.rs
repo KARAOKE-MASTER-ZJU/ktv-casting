@@ -20,6 +20,16 @@ pub mod playlist_manager;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
 
+/// Shared state for the Bilibili QR login flow (polled by Android UI / CLI).
+pub static BILI_AUTH_STATE: RwLock<BiliAuthState> = RwLock::new(BiliAuthState::Idle);
+
+pub enum BiliAuthState {
+    Idle,
+    AwaitingScan { qr_url: String },
+    Success { access_token: String, mid: u64 },
+    Error(String),
+}
+
 pub struct EngineContext {
     pub caster: Arc<dyn cast::Caster>,
     pub playlist_manager: PlaylistManager,
@@ -296,6 +306,29 @@ pub async fn get_volume_core() -> Result<u32, Box<dyn std::error::Error>> {
     };
     let v = ctx.caster.get_volume().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(v.unwrap_or(0))
+}
+
+pub async fn start_bilibili_engine_core(
+    base_url_str: String,
+    room_id: String,
+    session: cast::bilibili_caster::BilibiliSession,
+    device_buvid: String,
+    rt: tokio::runtime::Runtime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    info!("开始初始化Bilibili引擎, Room: {}", room_id);
+
+    if let Ok(mut guard) = ENGINE_STATE.write() {
+        if guard.is_some() {
+            *guard = None;
+        }
+    }
+
+    let caster: Arc<dyn cast::Caster> = Arc::new(
+        cast::bilibili_caster::BilibiliCaster::new(session, device_buvid)
+    );
+    let cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    connect_room(base_url_str, room_id, caster, "127.0.0.1".parse().unwrap(), 0, cache, rt).await
 }
 
 pub async fn discover_devices_core() -> Vec<DlnaDevice> {

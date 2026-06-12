@@ -1,3 +1,4 @@
+pub mod bilibili_caster;
 pub mod dlna_caster;
 pub mod progress;
 

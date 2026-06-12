@@ -1,6 +1,53 @@
 use reqwest::Client;
 use serde_json::Value;
 
+// 新算法 (2020-03+): https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/bvid_desc.html
+const BV_XOR_CODE: u64 = 23442827791579;
+const BV_MASK_CODE: u64 = 2251799813685247;
+const BV_BASE: u64 = 58;
+const BV_ALPHABET: &str = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
+// ENCODE_MAP = [8,7,0,5,1,3,2,4,6]; DECODE_MAP = reversed(ENCODE_MAP)
+const BV_DECODE_MAP: [usize; 9] = [6, 4, 2, 3, 1, 5, 0, 7, 8];
+
+pub fn bv_to_aid(bvid: &str) -> u64 {
+    let s = bvid.strip_prefix("BV1").unwrap_or(bvid);
+    let alpha: Vec<char> = BV_ALPHABET.chars().collect();
+    let chars: Vec<char> = s.chars().collect();
+    let mut tmp: u64 = 0;
+    for i in 0..9 {
+        let idx = alpha.iter().position(|&a| a == chars[BV_DECODE_MAP[i]]).unwrap_or(0) as u64;
+        tmp = tmp * BV_BASE + idx;
+    }
+    (tmp & BV_MASK_CODE) ^ BV_XOR_CODE
+}
+
+/// Returns `(cid, duration_secs)` for the given page of a BV video.
+pub async fn get_page_info(bv_id: &str, page: u32) -> Result<(u64, u32), String> {
+    let client = Client::new();
+    let url = format!("https://api.bilibili.com/x/player/pagelist?bvid={}", bv_id);
+    let json: Value = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let data = json["data"].as_array().ok_or("no data")?;
+    let idx = page as usize;
+    if idx >= data.len() {
+        return Err(format!("page {} out of range (len={})", page, data.len()));
+    }
+    let cid = data[idx]["cid"].as_u64().ok_or("no cid")?;
+    let duration = data[idx]["duration"].as_u64().map(|d| d as u32).unwrap_or(0);
+    Ok((cid, duration))
+}
+
+pub async fn get_page_duration(bv_id: &str, page: u32) -> Result<u32, String> {
+    get_page_info(bv_id, page).await.map(|(_, d)| d)
+}
+
 /// 获取BiliBili视频直链
 ///
 /// # Arguments

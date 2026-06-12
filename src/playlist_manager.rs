@@ -413,7 +413,6 @@ impl PlaylistManager {
         if !resp_json["success"].as_bool().unwrap_or(false) {
             return Err(format!("请求失败: {}", resp_json));
         }
-        self.fetch_playlist().await?;
 
         Ok(())
     }
