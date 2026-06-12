@@ -42,7 +42,10 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initSessionDir(
     _class: JClass,
     dir_path: JString,
 ) {
-    let dir_str: String = env.get_string(&dir_path).unwrap_or_default().into();
+    let dir_str = match env.get_string(&dir_path) {
+        Ok(s) => String::from(&s),
+        Err(_) => String::new(),
+    };
     if !dir_str.is_empty() {
         crate::cast::bilibili_caster::init_session_dir(&dir_str);
         info!("Session 目录初始化: {}", dir_str);
