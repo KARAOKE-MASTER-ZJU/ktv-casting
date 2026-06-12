@@ -68,21 +68,63 @@ async fn main() -> Result<()> {
 
 // --- 辅助逻辑函数 ---
 async fn select_dlna_device_interactively(controller: &DlnaController) -> Result<DlnaDevice> {
-    let devices = controller.discover_devices().await.unwrap_or_default();
-    if devices.is_empty() {
-        bail!("未发现任何 DLNA 设备");
+    println!("设备发现方式：");
+    println!("  1. 自动搜索（SSDP 多播）");
+    println!("  2. 直接输入 IP（适用于 WiFi 不支持多播的场景）");
+    print!("请选择 [1/2，默认1]：");
+    io::Write::flush(&mut io::stdout())?;
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+
+    if choice.trim() == "2" {
+        return select_device_by_url(controller).await;
     }
 
+    // 默认：多播搜索
+    println!("正在搜索 DLNA 设备（约5秒）...");
+    let devices = controller.discover_devices().await.unwrap_or_default();
+    if devices.is_empty() {
+        bail!("未发现任何 DLNA 设备，可尝试选择模式 2 直接输入 IP");
+    }
+    pick_from_device_list(devices)
+}
+
+async fn select_device_by_url(controller: &DlnaController) -> Result<DlnaDevice> {
+    println!("请输入设备 IP 或描述文件完整 URL");
+    println!("  示例 IP：  192.168.1.100");
+    println!("  示例 URL： http://192.168.1.100:9958/bilibili/description.xml");
+    print!("输入：");
+    io::Write::flush(&mut io::stdout())?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let raw = input.trim();
+
+    let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        // 只输入了 IP 或 IP:PORT，补全为 B站小电视默认路径
+        let host = raw.trim_end_matches('/');
+        format!("http://{}:9958/bilibili/description.xml", host)
+    };
+
+    println!("正在连接：{}", url);
+    controller
+        .get_device_from_url(&url)
+        .await
+        .with_context(|| format!("无法连接设备：{}", url))
+}
+
+fn pick_from_device_list(devices: Vec<DlnaDevice>) -> Result<DlnaDevice> {
     println!("发现以下设备：");
     for (i, d) in devices.iter().enumerate() {
-        println!("{}: {} at {}", i, d.friendly_name, d.location);
+        println!("  {}: {} ({})", i, d.friendly_name, d.location);
     }
     print!("输入设备编号：");
-    io::Write::flush(&mut io::stdout())?; // 确保提示文字先打印
+    io::Write::flush(&mut io::stdout())?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let idx: usize = input.trim().parse()?;
-    devices.get(idx).cloned().context("编号无效")
+    devices.into_iter().nth(idx).context("编号无效")
 }
 
 fn spawn_keyboard_handler() {
@@ -215,38 +257,36 @@ where
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let guard = ENGINE_STATE.read().unwrap();
-        if let Some(ctx) = guard.as_ref() {
-            // 1. 查询 DLNA 进度
-            if let Ok((curr, _)) = ctx.controller.get_secs(&ctx.device).await {
-                let curr_u64 = curr as u64;
+        let ctx = {
+            let guard = ENGINE_STATE.read().unwrap();
+            guard.as_ref().cloned()
+        };
 
-                // 2. 获取总时长
-                if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
-                    let cache = ctx.duration_cache.lock().await;
-                    if let Some(&total) = cache.get(&playing) {
-                        let total_u64 = total as u64;
+        let Some(ctx) = ctx else { break };
 
-                        set_len(total_u64);
-                        set_pos(curr_u64);
+        if let Ok(p) = ctx.caster.get_progress().await {
+            let curr_u64 = p.current_secs as u64;
 
-                        // 3. 自动切歌逻辑
-                        if total_u64 > 0
-                            && curr_u64 > 5
-                            && total_u64 > curr_u64
-                            && (total_u64 - curr_u64) <= 2
-                        {
-                            log::info!(">> 歌曲即将结束，自动切换下一首...");
-                            let mut pm = ctx.playlist_manager.clone();
-                            let _ = pm.next_song().await;
+            if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
+                let cache = ctx.duration_cache.lock().await;
+                if let Some(&total) = cache.get(&playing) {
+                    let total_u64 = total as u64;
+                    set_len(total_u64);
+                    set_pos(curr_u64);
 
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
+                    if total_u64 > 0
+                        && curr_u64 > 5
+                        && total_u64 > curr_u64
+                        && (total_u64 - curr_u64) <= 2
+                    {
+                        log::info!(">> 歌曲即将结束，自动切换下一首...");
+                        drop(cache);
+                        let mut pm = ctx.playlist_manager.clone();
+                        let _ = pm.next_song().await;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
             }
-        } else {
-            break;
         }
     }
     Ok(())
