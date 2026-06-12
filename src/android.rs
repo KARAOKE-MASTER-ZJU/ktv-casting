@@ -34,6 +34,21 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initLogging(
     info!("Android 日志与 Crypto 模块初始化完成");
 }
 
+/// 初始化 Session 存储目录（应在应用启动时调用，传入 context.filesDir.absolutePath）
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initSessionDir(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir_path: JString,
+) {
+    let dir_str: String = env.get_string(&dir_path).unwrap_or_default().into();
+    if !dir_str.is_empty() {
+        crate::cast::bilibili_caster::init_session_dir(&dir_str);
+        info!("Session 目录初始化: {}", dir_str);
+    }
+}
+
 struct LogBridge {
     java_vm: JavaVM,
     rust_engine_class: GlobalRef,

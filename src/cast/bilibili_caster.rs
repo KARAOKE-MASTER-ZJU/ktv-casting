@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,8 @@ use serde_json::Value;
 use crate::bilibili_parser::{bv_to_aid, get_page_info};
 use super::progress::LocalProgressTracker;
 use super::{Capabilities, CastError, Caster, Progress, SongRef};
+
+static SESSION_DIR: OnceLock<String> = OnceLock::new();
 
 const APPKEY: &str = "4409e2ce8ffd12b8";
 const APP_SECRET: &str = "59b43e04ad6965f34319062b478f83dd";
@@ -137,7 +140,7 @@ pub async fn login_qr(on_qr: impl Fn(String) + Send + Sync) -> Result<BilibiliSe
                     .to_string();
                 let mid = poll["data"]["mid"].as_u64().ok_or("no mid")?;
                 let session = BilibiliSession { access_token: token, mid };
-                let _ = save_session(&session); // Android 无写权限时静默忽略
+                save_session(&session)?;
                 return Ok(session);
             }
             Some(86038) => return Err("QR code expired".into()),
@@ -146,17 +149,46 @@ pub async fn login_qr(on_qr: impl Fn(String) + Send + Sync) -> Result<BilibiliSe
     }
 }
 
+/// Initialize session directory (call from Android/CLI startup)
+pub fn init_session_dir(dir: &str) {
+    let _ = SESSION_DIR.set(dir.to_string());
+    log::info!("[Bilibili] Session 目录已初始化: {}", dir);
+}
+
+fn get_session_file() -> PathBuf {
+    let dir = SESSION_DIR.get().map(|s| s.as_str()).unwrap_or(".");
+    PathBuf::from(dir).join(TOKEN_FILE)
+}
+
 pub fn save_session(session: &BilibiliSession) -> Result<(), String> {
     let json = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
-    std::fs::write(TOKEN_FILE, json).map_err(|e| e.to_string())
+    let path = get_session_file();
+    std::fs::write(&path, json).map_err(|e| {
+        let err_msg = format!("保存 session 失败: {} (路径: {})", e, path.display());
+        log::error!("[Bilibili] {}", err_msg);
+        err_msg
+    })?;
+    log::info!("[Bilibili] Session 已保存: {}", path.display());
+    Ok(())
 }
 
 /// Load saved session. Supports both our flat format and the Python nested format.
 pub fn load_session() -> Option<BilibiliSession> {
-    let text = std::fs::read_to_string(TOKEN_FILE).ok()?;
+    let path = get_session_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => {
+            log::info!("[Bilibili] 从 {} 读取 session", path.display());
+            t
+        }
+        Err(e) => {
+            log::debug!("[Bilibili] Session 文件不存在或无法读取: {} (路径: {})", e, path.display());
+            return None;
+        }
+    };
     let v: Value = serde_json::from_str(&text).ok()?;
     // Flat format (our own): {"access_token": "...", "mid": 123}
     if let (Some(t), Some(m)) = (v["access_token"].as_str(), v["mid"].as_u64()) {
+        log::info!("[Bilibili] 成功加载 session (UID: {})", m);
         return Some(BilibiliSession { access_token: t.into(), mid: m });
     }
     // Python format: {"data": {"token_info": {"access_token": "..."}, "mid": 123}}
@@ -164,8 +196,10 @@ pub fn load_session() -> Option<BilibiliSession> {
         v["data"]["token_info"]["access_token"].as_str(),
         v["data"]["mid"].as_u64(),
     ) {
+        log::info!("[Bilibili] 成功加载 session (Python 格式, UID: {})", m);
         return Some(BilibiliSession { access_token: t.into(), mid: m });
     }
+    log::warn!("[Bilibili] Session 格式无法识别");
     None
 }
 
