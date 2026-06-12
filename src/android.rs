@@ -521,6 +521,53 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startBilibiliEngine(
     });
 }
 
+/// 返回当前登录 Session 的 JSON 字符串，供 Android 持久化到 EncryptedSharedPreferences。
+/// 未登录时返回空字符串。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getBilibiliSessionJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+    use crate::cast::bilibili_caster::BilibiliSession;
+
+    let json = if let Ok(s) = BILI_AUTH_STATE.read() {
+        if let BiliAuthState::Success { access_token, mid } = &*s {
+            let session = BilibiliSession { access_token: access_token.clone(), mid: *mid };
+            serde_json::to_string(&session).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    env.new_string(json).unwrap().into_raw()
+}
+
+/// 从 Android 传入的 JSON 字符串恢复 Session（应用启动时调用）。
+/// 成功返回 1，JSON 无效返回 0。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_restoreBilibiliSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jint {
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+    use crate::cast::bilibili_caster::BilibiliSession;
+
+    let json_str: String = env.get_string(&json).unwrap().into();
+    if let Ok(session) = serde_json::from_str::<BilibiliSession>(&json_str) {
+        if let Ok(mut s) = BILI_AUTH_STATE.write() {
+            *s = BiliAuthState::Success { access_token: session.access_token, mid: session.mid };
+        }
+        1
+    } else {
+        0
+    }
+}
+
 // 12. 数据接口：获取当前歌曲标题
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
