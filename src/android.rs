@@ -467,7 +467,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_listBilibiliDevices(
 
     let session = if let Ok(s) = BILI_AUTH_STATE.read() {
         if let BiliAuthState::Success { access_token, mid } = &*s {
-            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid })
+            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid, expires_at: None })
         } else {
             None
         }
@@ -491,6 +491,43 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_listBilibiliDevices(
     env.new_string(json).unwrap().into_raw()
 }
 
+/// 检查 B 站 token 是否已过期。返回 true 表示已过期，false 表示有效或无法判断。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_isBilibiliSessionExpired(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    use crate::cast::bilibili_caster::{is_session_expired, load_session};
+
+    if let Some(session) = load_session() {
+        if is_session_expired(&session) {
+            log::warn!("[Bilibili] Token 已过期，清除 session");
+            let _ = crate::cast::bilibili_caster::clear_session();
+            return jboolean::from(true);
+        }
+    }
+    jboolean::from(false)
+}
+
+/// 清除保存的 B 站 session。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_clearBilibiliSession(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    use crate::cast::bilibili_caster::clear_session;
+
+    match clear_session() {
+        Ok(_) => jboolean::from(true),
+        Err(e) => {
+            log::error!("[Bilibili] 清除 session 失败: {}", e);
+            jboolean::from(false)
+        }
+    }
+}
+
 /// 启动B站投屏引擎。
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
@@ -510,7 +547,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startBilibiliEngine(
 
     let session = if let Ok(s) = BILI_AUTH_STATE.read() {
         if let BiliAuthState::Success { access_token, mid } = &*s {
-            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid })
+            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid, expires_at: None })
         } else {
             None
         }
@@ -552,7 +589,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getBilibiliSessionJs
 
     let json = if let Ok(s) = BILI_AUTH_STATE.read() {
         if let BiliAuthState::Success { access_token, mid } = &*s {
-            let session = BilibiliSession { access_token: access_token.clone(), mid: *mid };
+            let session = BilibiliSession { access_token: access_token.clone(), mid: *mid, expires_at: None };
             serde_json::to_string(&session).unwrap_or_default()
         } else {
             String::new()

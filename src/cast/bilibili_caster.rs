@@ -25,6 +25,8 @@ pub const TOKEN_FILE: &str = "bili_session.json";
 pub struct BilibiliSession {
     pub access_token: String,
     pub mid: u64,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,7 +141,11 @@ pub async fn login_qr(on_qr: impl Fn(String) + Send + Sync) -> Result<BilibiliSe
                     .ok_or("no access_token")?
                     .to_string();
                 let mid = poll["data"]["mid"].as_u64().ok_or("no mid")?;
-                let session = BilibiliSession { access_token: token, mid };
+                let expires_in = poll["data"]["token_info"]["expires_in"]
+                    .as_u64()
+                    .unwrap_or(7776000);
+                let expires_at = Some(now_ts() + expires_in);
+                let session = BilibiliSession { access_token: token, mid, expires_at };
                 save_session(&session)?;
                 return Ok(session);
             }
@@ -186,10 +192,11 @@ pub fn load_session() -> Option<BilibiliSession> {
         }
     };
     let v: Value = serde_json::from_str(&text).ok()?;
-    // Flat format (our own): {"access_token": "...", "mid": 123}
+    // Flat format (our own): {"access_token": "...", "mid": 123, "expires_at": ...}
     if let (Some(t), Some(m)) = (v["access_token"].as_str(), v["mid"].as_u64()) {
-        log::info!("[Bilibili] 成功加载 session (UID: {})", m);
-        return Some(BilibiliSession { access_token: t.into(), mid: m });
+        let expires_at = v["expires_at"].as_u64();
+        log::info!("[Bilibili] 成功加载 session (UID: {}, expires_at: {:?})", m, expires_at);
+        return Some(BilibiliSession { access_token: t.into(), mid: m, expires_at });
     }
     // Python format: {"data": {"token_info": {"access_token": "..."}, "mid": 123}}
     if let (Some(t), Some(m)) = (
@@ -197,10 +204,35 @@ pub fn load_session() -> Option<BilibiliSession> {
         v["data"]["mid"].as_u64(),
     ) {
         log::info!("[Bilibili] 成功加载 session (Python 格式, UID: {})", m);
-        return Some(BilibiliSession { access_token: t.into(), mid: m });
+        return Some(BilibiliSession { access_token: t.into(), mid: m, expires_at: None });
     }
     log::warn!("[Bilibili] Session 格式无法识别");
     None
+}
+
+pub fn is_session_expired(session: &BilibiliSession) -> bool {
+    match session.expires_at {
+        Some(expires_at) => {
+            let current_ts = now_ts();
+            let expired = current_ts >= expires_at;
+            if expired {
+                log::warn!("[Bilibili] Token 已过期: now={}, expires_at={}", current_ts, expires_at);
+            }
+            expired
+        }
+        None => false,
+    }
+}
+
+pub fn clear_session() -> Result<(), String> {
+    let path = get_session_file();
+    std::fs::remove_file(&path).map_err(|e| {
+        let err_msg = format!("清除 session 失败: {} (路径: {})", e, path.display());
+        log::error!("[Bilibili] {}", err_msg);
+        err_msg
+    })?;
+    log::info!("[Bilibili] Session 已清除: {}", path.display());
+    Ok(())
 }
 
 pub async fn list_devices(session: &BilibiliSession) -> Result<Vec<BilibiliDevice>, String> {

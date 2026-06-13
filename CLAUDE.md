@@ -17,3 +17,28 @@
 - Bilibili token 存储在应用专属目录 (Android filesDir)，使用 EncryptedSharedPreferences
 - Rust 版本锁定到 1.81 (rust-toolchain.toml)
 - 库版本在 Cargo.toml 中维护，应与 GitHub release tag 保持一致
+
+## GitHub Actions CI 检查流程
+
+推送新版本和 tag 后，使用 gh cli 检查 Android App 构建状态：
+
+```bash
+# 进入 Android App 目录
+cd /Users/ypy/projects/ktv-casting-android-app
+
+# 查看最近的构建状态（显示最近 5 次）
+gh run list --repo birchtree2/ktv-casting-android-app --limit 5 --json status,conclusion,name,createdAt,headBranch
+
+# 获取最新运行的 ID
+LATEST_RUN=$(gh run list --repo birchtree2/ktv-casting-android-app --limit 1 --json databaseId | jq -r '.[0].databaseId')
+
+# 查看特定运行的详细状态
+gh run view $LATEST_RUN --repo birchtree2/ktv-casting-android-app --json status,conclusion,headBranch
+
+# 在浏览器中打开运行详情页面
+gh run view $LATEST_RUN --repo birchtree2/ktv-casting-android-app --web
+```
+
+**关键字段说明：**
+- `status`: `queued` (排队中), `in_progress` (运行中), `completed` (已完成)
+- `conclusion`: `success` (成功), `failure` (失败), `neutral` (中立), 空值表示正在运行
