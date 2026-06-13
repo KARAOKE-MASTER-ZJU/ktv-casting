@@ -2,7 +2,7 @@
 use crate::ENGINE_STATE;
 use jni::JNIEnv;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::{jint, jobjectArray, jsize, jstring, jintArray};
+use jni::sys::{jboolean, jint, jobjectArray, jsize, jstring, jintArray};
 use jni::JavaVM;
 use log::{info, Log, Metadata, Record};
 use std::sync::OnceLock;
