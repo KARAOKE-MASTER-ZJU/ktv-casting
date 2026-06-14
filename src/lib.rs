@@ -228,11 +228,23 @@ pub async fn connect_room(
     let pm = PlaylistManager::new(&base_url_str, room_id);
 
     let caster_cb = Arc::clone(&caster);
+    let cache_cb = Arc::clone(&cache);
     pm.start_sync(move |video_url| {
         let c = Arc::clone(&caster_cb);
+        let cache = Arc::clone(&cache_cb);
         Box::pin(async move {
             info!("通知设备准备拉取路径: {}", video_url);
-            let _ = c.play_song(&cast::SongRef(video_url)).await;
+            let _ = c.play_song(&cast::SongRef(video_url.clone())).await;
+
+            // 如果是 BV 视频，立刻从 bilibili API 获取时长并写入 cache
+            if let Some(bvid) = extract_bvid(&video_url) {
+                if let Ok((_, duration)) = crate::bilibili_parser::get_page_info(&bvid, 0).await {
+                    if duration > 0 {
+                        cache.lock().await.insert(video_url, duration);
+                        debug!("[DLNA] 预填充 BV 视频时长到 cache: {} -> {}s", bvid, duration);
+                    }
+                }
+            }
         })
     });
 
@@ -252,6 +264,15 @@ pub async fn connect_room(
     }
 
     Ok(())
+}
+
+fn extract_bvid(video_url: &str) -> Option<String> {
+    if let Some((bv, _)) = video_url.split_once("-page") {
+        if bv.starts_with("BV") {
+            return Some(bv.to_string());
+        }
+    }
+    None
 }
 
 pub async fn get_total_duration() -> u32 {
