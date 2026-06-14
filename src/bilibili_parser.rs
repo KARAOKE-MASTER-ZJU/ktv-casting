@@ -52,7 +52,7 @@ pub async fn get_page_duration(bv_id: &str, page: u32) -> Result<u32, String> {
 ///
 /// # Arguments
 /// * `bv_id` - 视频BV号（例如："BV1AP411x7YW"）
-/// * `page` - 分P页码，默认为1
+/// * `page` - 分P页码，默认为0
 ///
 /// # Returns
 /// * `Result<String, String>` - 返回直链URL或错误信息
