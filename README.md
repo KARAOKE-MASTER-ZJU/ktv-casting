@@ -1,37 +1,92 @@
-# 与[ktv-song-web](https://github.com/StarFreedomX/ktv-song-web)搭配的命令行DLNA投屏软件
+# ktv-casting
 
-[开发者文档](docs/DEVELOPER.md)
-## 使用方式
+将 [ktv-song-web](https://github.com/KARAOKE-MASTER-ZJU/ktv-song-web) 点歌台的歌曲投屏到 **DLNA 设备** 或 **哔哩哔哩小电视** 的命令行工具与核心引擎。
 
-输入搭建好的[ktv-song-web](https://github.com/StarFreedomX/ktv-song-web)服务的网址（含对应房间编号），如`http://ktv.example.com/101`，随后选择搜索到的DLNA设备，即可使用。
+> **配套 Android App**：[ktv-casting-android-app](https://github.com/KARAOKE-MASTER-ZJU/ktv-casting-android-app)
 
-## 功能
+---
 
-跟随网页的正在播放曲目进行投屏，结束自动切歌。也可以在网页端操作进行切歌。
+## 功能概览
 
-命令行支持`Ctrl+P`暂停/继续播放
+- **两种投屏模式**
+  - **DLNA 模式**：通过 UPnP/SSDP 发现局域网内的 DLNA 渲染器，使用 SOAP (AVTransport) 控制播放
+  - **Bilibili 模式**：通过 B 站扫码登录，投屏到 Bilibili TV 端设备（小电视/盒子等）
+- **本地媒体代理**：自动将 B 站视频链接转为 DLNA 设备可拉取的 HTTP 流（默认 `0.0.0.0:8080`），支持 Range 请求与进度拖拽
+- **实时同步**：支持 WebSocket（默认，低延迟）和 HTTP 轮询两种模式，与点歌台保持歌曲列表同步
+- **自动切歌**：检测歌曲播放结束后自动切换到下一首
+- **音量控制**：通过 DLNA RenderingControl 服务调节音量
+- **CLI 交互式控制**：暂停/继续、切歌、音量调节、进度条
+- **Android JNI 支持**：提供完整的 JNI 接口，可作为 Android 应用的 Native 引擎
+- **跨平台编译**：支持 Windows、macOS、Linux、Android (4 种 ABI)
 
-## 环境变量设置
+---
 
-- `KTV_SYNC_MODE`：同步模式，支持`WS`（WebSocket, 默认）和`POLLING`（轮询）。设置为`WS`时会使用WebSocket连接进行实时同步，延迟更低~~(对ktv-song-web服务器压力更小)~~。
-- `RUST_LOG`：日志等级设置，有`error`、`warn`、`info`、`debug`等，参考[env_logger文档](https://docs.rs/env_logger/latest/env_logger/)。
-- `KTV_NICKNAME`：设置投屏设备的名称。
-- `KEEP_ALIVE_INTERVAL`：连接Keep-Alive间隔，单位秒，默认30秒。
+## 快速开始
 
-## 手机上怎么用
+### 命令行模式
 
-1. 下载并安装[Termux](https://termux.com/)。
-2. 从[这里](https://github.com/aspromise/ktv-casting/releases)下载最新的`ktv-casting-aarch64-linux-android`可执行文件。
-建议可以直接在Termux中使用`curl -LO <下载链接>`命令下载。以`v0.1.5`版本为例，命令如下：
 ```bash
-curl -LO https://github.com/aspromise/ktv-casting/releases/download/v0.1.5/ktv-casting-aarch64-linux-android
-```
-3. 赋予可执行权限：
-```bash
-chmod +x ktv-casting-aarch64-linux-android
-```
-4. 运行程序：
-```bash
-./ktv-casting-aarch64-linux-android
+cargo run --release
 ```
 
+程序会交互式引导：
+
+1. 输入房间链接（例如 `https://ktv.example.com/102`）
+2. 选择投屏模式（1: DLNA / 2: Bilibili）
+3. 选择设备
+
+#### 房间链接格式
+
+- `https://ktv.example.com/102` — 路径最后一段
+- `https://ktv.example.com/?roomId=102` — URL 查询参数
+
+#### 快捷键
+
+| 按键 | 功能 |
+|------|------|
+| `p` | 暂停 / 继续 |
+| `n` | 切歌 |
+| `+` / `=` | 音量 +5 |
+| `-` | 音量 -5 |
+| `Ctrl-C` | 退出 |
+
+### Android App
+
+直接安装 [ktv-casting-android-app](https://github.com/KARAOKE-MASTER-ZJU/ktv-casting-android-app) 即可获得完整 UI 体验。
+
+---
+
+## 环境变量
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `KTV_SYNC_MODE` | 同步模式：`WS`（WebSocket）或 `POLLING`（轮询） | `WS` |
+| `RUST_LOG` | 日志等级：`error`, `warn`, `info`, `debug` 等 | `INFO` |
+| `KTV_NICKNAME` | 投屏设备名称（通过 WebSocket 传给点歌台） | 空 |
+| `KEEP_ALIVE_INTERVAL` | WebSocket 心跳间隔（秒） | `30` |
+
+---
+
+## 编译
+
+### 桌面端
+
+```bash
+cargo build --release
+```
+
+### Android ABI
+
+```bash
+rustup target add aarch64-linux-android
+cargo ndk -t arm64-v8a build --lib --release
+```
+
+
+---
+
+## 开发者文档
+
+详细的架构说明、模块介绍、协议详解、抓包调试指南等请参阅：
+
+👉 **[docs/DEVELOPER.md](docs/DEVELOPER.md)**
