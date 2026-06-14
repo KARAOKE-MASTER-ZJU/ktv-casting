@@ -21,6 +21,7 @@ pub struct PlaylistManager {
     hash: Arc<Mutex<Option<String>>>,
     song_playing: Arc<Mutex<Option<String>>>,
     song_title: Arc<Mutex<Option<String>>>,
+    queued_count: Arc<Mutex<usize>>,
 }
 
 impl PlaylistManager {
@@ -37,6 +38,7 @@ impl PlaylistManager {
             hash: Arc::new(Mutex::new(None)),
             song_playing: Arc::new(Mutex::new(None)),
             song_title: Arc::new(Mutex::new(None)),
+            queued_count: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -112,10 +114,17 @@ impl PlaylistManager {
 
         info!("新的hash: {}", new_hash);
 
+        // 获取队列中还有多少首歌未播
+        let queued_count = resp_json["list"]["queued"]
+            .as_array()
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+
         // 更新状态
         *self.song_playing.lock().await = singing_url.clone();
         *self.song_title.lock().await = singing_title; // 更新标题
         *self.hash.lock().await = Some(new_hash);
+        *self.queued_count.lock().await = queued_count;
 
         Ok(singing_url)
     }
@@ -423,6 +432,10 @@ impl PlaylistManager {
 
     pub async fn get_song_title(&self) -> Option<String> {
         self.song_title.lock().await.clone()
+    }
+
+    pub async fn get_queued_count(&self) -> usize {
+        *self.queued_count.lock().await
     }
 }
 

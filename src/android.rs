@@ -647,3 +647,19 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getCurrentSongTitle(
         .expect("Couldn't create java string!")
         .into_raw()
 }
+
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getQueuedSongsCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return ctx.rt.block_on(async {
+                ctx.playlist_manager.get_queued_count().await as jint
+            });
+        }
+    }
+    -1
+}
