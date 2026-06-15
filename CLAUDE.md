@@ -18,6 +18,22 @@
 - Rust 版本锁定到 1.81 (rust-toolchain.toml)
 - 库版本在 Cargo.toml 中维护，应与 GitHub release tag 保持一致
 
+## Rust 库与 Android App 的版本联动
+
+**重要：** 每次更新 Rust 库（ktv-casting）并打新 tag 后，必须同步更新 Android App 的 `gradle.properties`：
+
+```
+# ktv-casting-android-app/gradle.properties
+rust_libs_version=v1.x.x   ← 必须与 Rust 库的 release tag 一致
+```
+
+**流程：**
+1. Rust 库改动 → commit → 打 tag（如 `v1.5.0`）→ push → CI 构建 `.so`
+2. 修改 Android App 的 `gradle.properties`，将 `rust_libs_version` 改为新 tag
+3. commit → 打 App tag → push
+
+**不更新此值的后果：** App CI 会下载旧版 `.so`，导致新 JNI 函数缺失，运行时 `UnsatisfiedLinkError` 崩溃。
+
 ## GitHub Actions CI 检查流程
 
 推送新版本和 tag 后，使用 gh cli 检查 Android App 构建状态：
