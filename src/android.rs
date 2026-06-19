@@ -313,6 +313,44 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getVolume(
 }
 
 
+// 10b. 控制接口：相对音量调节（B站投屏只支持相对步进，DLNA 内部按 get+set 模拟）
+// 返回 1 表示成功，-1 表示失败
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_volumeUp(
+    _env: JNIEnv,
+    _class: JClass,
+    step: jint,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return match ctx.rt.block_on(crate::volume_up_core(step as u32)) {
+                Ok(()) => 1,
+                Err(_) => -1,
+            };
+        }
+    }
+    -1
+}
+
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_volumeDown(
+    _env: JNIEnv,
+    _class: JClass,
+    step: jint,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return match ctx.rt.block_on(crate::volume_down_core(step as u32)) {
+                Ok(()) => 1,
+                Err(_) => -1,
+            };
+        }
+    }
+    -1
+}
+
 // 11. 控制接口：跳转进度 (Seek)
 // 返回 1 表示成功，-1 表示失败
 #[allow(non_snake_case)]

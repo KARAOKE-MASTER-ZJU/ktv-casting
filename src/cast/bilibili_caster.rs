@@ -437,6 +437,16 @@ impl Caster for BilibiliCaster {
         Ok(None)
     }
 
+    // B站投屏没有"绝对音量"接口，只有设备侧按固定步长调整的相对指令：
+    // command=8 音量+，command=12 音量-（与 main.py 的 cmd 8 / 12 一致）。
+    async fn volume_up(&self, _step: u32) -> Result<(), CastError> {
+        self.send_cmd(8, 0, None, 0).await
+    }
+
+    async fn volume_down(&self, _step: u32) -> Result<(), CastError> {
+        self.send_cmd(12, 0, None, 0).await
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             absolute_volume: false,

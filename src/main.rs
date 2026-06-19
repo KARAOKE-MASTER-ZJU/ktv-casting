@@ -7,6 +7,7 @@ use ktv_casting_lib::cast::bilibili_caster::{self as bili, BilibiliSession};
 use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
 use ktv_casting_lib::{
     ENGINE_STATE, start_bilibili_engine_core, start_engine_core, toggle_pause_core, trigger_next_song,
+    volume_down_core, volume_up_core,
 };
 use log::{Log, Metadata, Record, info};
 use std::fmt::Write;
@@ -191,6 +192,8 @@ fn pick_from_device_list(devices: Vec<DlnaDevice>) -> Result<DlnaDevice> {
     devices.into_iter().nth(idx).context("编号无效")
 }
 
+const VOLUME_STEP: u32 = 5;
+
 fn spawn_keyboard_handler() {
     let _ = terminal::enable_raw_mode();
     tokio::task::spawn_blocking(move || {
@@ -225,6 +228,18 @@ fn spawn_keyboard_handler() {
                         event::KeyCode::Char('n') => {
                             trigger_next_song();
                             info!("⏭ 切歌");
+                        }
+                        event::KeyCode::Char('+') | event::KeyCode::Char('=') => {
+                            match volume_up_core(VOLUME_STEP).await {
+                                Ok(()) => info!("🔊 音量 +"),
+                                Err(e) => info!("音量调节失败: {}", e),
+                            }
+                        }
+                        event::KeyCode::Char('-') => {
+                            match volume_down_core(VOLUME_STEP).await {
+                                Ok(()) => info!("🔉 音量 -"),
+                                Err(e) => info!("音量调节失败: {}", e),
+                            }
                         }
                         _ => {}
                     }

@@ -329,6 +329,24 @@ pub async fn get_volume_core() -> Result<u32, Box<dyn std::error::Error>> {
     Ok(v.unwrap_or(0))
 }
 
+pub async fn volume_up_core(step: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = {
+        let guard = ENGINE_STATE.read().map_err(|_| "Lock error")?;
+        guard.as_ref().cloned().ok_or("Engine not initialized")?
+    };
+    ctx.caster.volume_up(step).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok(())
+}
+
+pub async fn volume_down_core(step: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = {
+        let guard = ENGINE_STATE.read().map_err(|_| "Lock error")?;
+        guard.as_ref().cloned().ok_or("Engine not initialized")?
+    };
+    ctx.caster.volume_down(step).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok(())
+}
+
 pub async fn start_bilibili_engine_core(
     base_url_str: String,
     room_id: String,

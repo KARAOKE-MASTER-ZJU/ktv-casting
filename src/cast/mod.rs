@@ -48,5 +48,19 @@ pub trait Caster: Send + Sync {
     async fn get_progress(&self) -> Result<Progress, CastError>;
     async fn set_volume(&self, volume: u32) -> Result<(), CastError>;
     async fn get_volume(&self) -> Result<Option<u32>, CastError>;
+
+    /// 相对调高音量。默认实现基于 get_volume/set_volume；不支持绝对音量的
+    /// Caster（如 Bilibili 投屏）应覆盖此方法，改为发送设备原生的相对音量指令。
+    async fn volume_up(&self, step: u32) -> Result<(), CastError> {
+        let current = self.get_volume().await?.unwrap_or(0);
+        self.set_volume((current + step).min(100)).await
+    }
+
+    /// 相对调低音量，参见 [`Caster::volume_up`]。
+    async fn volume_down(&self, step: u32) -> Result<(), CastError> {
+        let current = self.get_volume().await?.unwrap_or(0);
+        self.set_volume(current.saturating_sub(step)).await
+    }
+
     fn capabilities(&self) -> Capabilities;
 }
