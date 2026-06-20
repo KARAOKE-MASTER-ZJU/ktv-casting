@@ -6,8 +6,8 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use ktv_casting_lib::cast::bilibili_caster::{self as bili, BilibiliSession};
 use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
 use ktv_casting_lib::{
-    ENGINE_STATE, start_bilibili_engine_core, start_engine_core, toggle_pause_core, trigger_next_song,
-    volume_down_core, volume_up_core,
+    ENGINE_STATE, cycle_quality_core, start_bilibili_engine_core, start_engine_core, toggle_danmaku_core,
+    toggle_pause_core, trigger_next_song, volume_down_core, volume_up_core,
 };
 use log::{Log, Metadata, Record, info};
 use std::fmt::Write;
@@ -77,6 +77,8 @@ async fn main() -> Result<()> {
     println!("  n      切下一首");
     println!("  + / =  音量 +5");
     println!("  -      音量 -5");
+    println!("  d      弹幕开关（仅B站投屏）");
+    println!("  q      切换清晰度（仅B站投屏）");
     println!("  Ctrl-C 退出");
     println!("─────────────────────────────────────────");
     spawn_keyboard_handler();
@@ -239,6 +241,19 @@ fn spawn_keyboard_handler() {
                             match volume_down_core(VOLUME_STEP).await {
                                 Ok(()) => info!("🔉 音量 -"),
                                 Err(e) => info!("音量调节失败: {}", e),
+                            }
+                        }
+                        event::KeyCode::Char('d') => {
+                            match toggle_danmaku_core().await {
+                                Ok(true) => info!("💬 弹幕已开启"),
+                                Ok(false) => info!("💬 弹幕已关闭"),
+                                Err(e) => info!("弹幕切换失败: {}", e),
+                            }
+                        }
+                        event::KeyCode::Char('q') => {
+                            match cycle_quality_core().await {
+                                Ok(quality) => info!("🎬 清晰度已切换为 {}", quality.label()),
+                                Err(e) => info!("清晰度切换失败: {}", e),
                             }
                         }
                         _ => {}

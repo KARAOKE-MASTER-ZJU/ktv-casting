@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::bilibili_parser::{bv_to_aid, get_page_info};
 use super::progress::LocalProgressTracker;
-use super::{Capabilities, CastError, Caster, Progress, SongRef};
+use super::{Capabilities, CastError, Caster, Progress, Quality, SongRef};
 
 static SESSION_DIR: OnceLock<String> = OnceLock::new();
 
@@ -403,7 +403,18 @@ impl Caster for BilibiliCaster {
             serde_json::json!({ "oid": aid, "cid": cid, "type": 101 })
         };
         log::info!("[Bilibili] sending play command: aid={}, cid={}, page={}, extra={}", aid, cid, page, extra);
-        self.send_cmd(1, aid, Some(extra), 0).await
+        self.send_cmd(1, aid, Some(extra), 0).await?;
+
+        // 每次开始投屏都重置为默认状态：弹幕关闭、清晰度 1080P。
+        // 设备侧没有读回接口，所以这里只能假定默认值，不要求成功才算播放成功。
+        if let Err(e) = self.set_danmaku(false).await {
+            log::warn!("[Bilibili] 设置默认弹幕状态失败: {}", e);
+        }
+        if let Err(e) = self.set_quality(Quality::default()).await {
+            log::warn!("[Bilibili] 设置默认清晰度失败: {}", e);
+        }
+
+        Ok(())
     }
 
     async fn resume(&self) -> Result<(), CastError> {
@@ -445,6 +456,19 @@ impl Caster for BilibiliCaster {
 
     async fn volume_down(&self, _step: u32) -> Result<(), CastError> {
         self.send_cmd(12, 0, None, 0).await
+    }
+
+    // command=9：弹幕开关，与 main.py 的 cmd 9 一致。
+    async fn set_danmaku(&self, on: bool) -> Result<(), CastError> {
+        self.send_cmd(9, 0, Some(serde_json::json!({ "danmaku_switch": on })), 0).await
+    }
+
+    // command=10：切换清晰度，与 main.py 的 cmd 10 一致。
+    async fn set_quality(&self, quality: Quality) -> Result<(), CastError> {
+        let extra = serde_json::json!({
+            "qn": { "currentQn": { "quality": quality.as_qn() }, "userDesireQn": 0 }
+        });
+        self.send_cmd(10, 0, Some(extra), 0).await
     }
 
     fn capabilities(&self) -> Capabilities {

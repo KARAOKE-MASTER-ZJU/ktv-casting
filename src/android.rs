@@ -351,6 +351,92 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_volumeDown(
     -1
 }
 
+// 10c. 控制接口：弹幕开关（仅B站投屏支持，DLNA 会返回 -1）
+// 返回切换后的状态：1=开，0=关，-1=失败
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_toggleDanmaku(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return match ctx.rt.block_on(crate::toggle_danmaku_core()) {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(_) => -1,
+            };
+        }
+    }
+    -1
+}
+
+// 直接设置弹幕开关（供开关类 UI 使用，避免依赖本地状态做盲翻转）
+// 返回设置后的状态：1=开，0=关，-1=失败
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_setDanmaku(
+    _env: JNIEnv,
+    _class: JClass,
+    on: jboolean,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return match ctx.rt.block_on(crate::set_danmaku_core(on != 0)) {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(_) => -1,
+            };
+        }
+    }
+    -1
+}
+
+// 返回本地跟踪的弹幕状态（设备侧无读回接口），1=开，0=关
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getDanmakuState(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    jboolean::from(crate::get_danmaku_core())
+}
+
+// 10d. 控制接口：清晰度（仅B站投屏支持，DLNA 会返回 -1）
+// qn 跨 JNI 边界仍传裸 int（B站协议常量：16/32/64/80/116），Rust 内部转换成
+// Quality enum 做合法性校验，拒绝非法档位。
+// 返回设置后的 qn，失败（含非法 qn）返回 -1
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_setQuality(
+    _env: JNIEnv,
+    _class: JClass,
+    qn: jint,
+) -> jint {
+    let Some(quality) = crate::cast::Quality::from_qn(qn as u32) else {
+        return -1;
+    };
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return match ctx.rt.block_on(crate::set_quality_core(quality)) {
+                Ok(q) => q.as_qn() as jint,
+                Err(_) => -1,
+            };
+        }
+    }
+    -1
+}
+
+// 返回本地跟踪的清晰度 qn（设备侧无读回接口）
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getQuality(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    crate::get_quality_core().as_qn() as jint
+}
+
 // 11. 控制接口：跳转进度 (Seek)
 // 返回 1 表示成功，-1 表示失败
 #[allow(non_snake_case)]
