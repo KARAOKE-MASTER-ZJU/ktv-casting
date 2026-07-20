@@ -106,12 +106,12 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.platform.command }}" == "ndk" ]; then
-            # Android: 只编译库，禁用默认 feature 从而避开 cli 相关依赖
-            cargo ndk -t ${{ matrix.platform.abi }} build --release --lib --no-default-features
+            # Android: 只编译库
+            cargo ndk -t ${{ matrix.platform.abi }} build --release --lib
           elif [ "${{ matrix.platform.command }}" == "cross" ]; then
-            cross build --release --target ${{ matrix.platform.target }} --features cli
+            cross build --release --target ${{ matrix.platform.target }}
           else
-            cargo build --release --target ${{ matrix.platform.target }} --features cli
+            cargo build --release --target ${{ matrix.platform.target }}
           fi
 
       - name: Package Assets
@@ -146,20 +146,20 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-  dispatch-to-android:
-    name: Dispatch Android App Build
-    needs: build-and-upload # 确保编译任务全部成功后才通知
-    runs-on: ubuntu-latest
-    # 限制条件：如果是 Pull Request 就不执行（防止 Secret 为空报错），仅在 Push / 打 Tag 时执行。
-    # 这样既可以检查编译错误，又能确保APP仓库在正式合并后才会收到通知，拿到最新的库文件。
-    # 只有当Pull Request被合并后，才会触发Push事件，从而执行这个任务，确保APP仓库能拿到最新的库文件
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: Trigger Android App Build
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.APP_REPO_TOKEN }} 
-          #跨仓库，需要申请PAT(Personal Access Token)，并设置权限为repo，最后将Token添加到当前仓库的Secrets中
-          repository: birchtree2/ktv-casting-android-app
-          event-type: rust-lib-updated
-          client-payload: '{"version": "${{ github.ref_name }}"}'
+#  dispatch-to-android:
+#    name: Dispatch Android App Build
+#    needs: build-and-upload # 确保编译任务全部成功后才通知
+#    runs-on: ubuntu-latest
+#    # 限制条件：如果是 Pull Request 就不执行（防止 Secret 为空报错），仅在 Push / 打 Tag 时执行。
+#    # 这样既可以检查编译错误，又能确保APP仓库在正式合并后才会收到通知，拿到最新的库文件。
+#    # 只有当Pull Request被合并后，才会触发Push事件，从而执行这个任务，确保APP仓库能拿到最新的库文件
+#    if: github.event_name != 'pull_request'
+#    steps:
+#      - name: Trigger Android App Build
+#        uses: peter-evans/repository-dispatch@v3
+#        with:
+#          token: ${{ secrets.APP_REPO_TOKEN }}
+#          #跨仓库，需要申请PAT(Personal Access Token)，并设置权限为repo，最后将Token添加到当前仓库的Secrets中
+#          repository: birchtree2/ktv-casting-android-app
+#          event-type: rust-lib-updated
+#          client-payload: '{"version": "${{ github.ref_name }}"}'
