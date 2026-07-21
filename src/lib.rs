@@ -4,7 +4,7 @@ use crate::playlist_manager::PlaylistManager;
 use actix_web::{App, HttpServer, web};
 use log::{info, debug};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, /*AtomicU32,*/ Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
@@ -38,8 +38,8 @@ pub struct EngineContext {
     pub server_port: u16,
     pub is_playing: AtomicBool,
     /// 仅 Bilibili 投屏使用：本地跟踪的弹幕/清晰度状态（设备侧没有读回接口）。
-    pub danmaku_on: AtomicBool,
-    pub quality_qn: AtomicU32,
+    // pub danmaku_on: AtomicBool,
+    // pub quality_qn: AtomicU32,
     pub rt: tokio::runtime::Runtime,
 }
 
@@ -265,8 +265,8 @@ pub async fn connect_room(
         local_ip: local_ip_addr,
         server_port: port,
         is_playing: AtomicBool::new(true),
-        danmaku_on: AtomicBool::new(false),
-        quality_qn: AtomicU32::new(cast::Quality::default().as_qn()),
+        // danmaku_on: AtomicBool::new(false),
+        // quality_qn: AtomicU32::new(cast::Quality::default().as_qn()),
         rt,
     });
 
@@ -366,7 +366,7 @@ pub async fn set_danmaku_core(on: bool) -> Result<bool, Box<dyn std::error::Erro
         guard.as_ref().cloned().ok_or("Engine not initialized")?
     };
     ctx.caster.set_danmaku(on).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    ctx.danmaku_on.store(on, Ordering::SeqCst);
+    // ctx.danmaku_on.store(on, Ordering::SeqCst);
     Ok(on)
 }
 
@@ -379,7 +379,8 @@ pub async fn toggle_danmaku_core() -> Result<bool, Box<dyn std::error::Error>> {
 pub fn get_danmaku_core() -> bool {
     if let Ok(guard) = ENGINE_STATE.read() {
         if let Some(ctx) = guard.as_ref() {
-            return ctx.danmaku_on.load(Ordering::SeqCst);
+            // return ctx.danmaku_on.load(Ordering::SeqCst);
+            return ctx.caster.get_danmaku().unwrap_or_default();
         }
     }
     false
@@ -392,7 +393,7 @@ pub async fn set_quality_core(quality: cast::Quality) -> Result<cast::Quality, B
         guard.as_ref().cloned().ok_or("Engine not initialized")?
     };
     ctx.caster.set_quality(quality).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    ctx.quality_qn.store(quality.as_qn(), Ordering::SeqCst);
+    // ctx.quality_qn.store(quality.as_qn(), Ordering::SeqCst);
     Ok(quality)
 }
 
@@ -405,7 +406,8 @@ pub async fn cycle_quality_core() -> Result<cast::Quality, Box<dyn std::error::E
 pub fn get_quality_core() -> cast::Quality {
     if let Ok(guard) = ENGINE_STATE.read() {
         if let Some(ctx) = guard.as_ref() {
-            return cast::Quality::from_qn(ctx.quality_qn.load(Ordering::SeqCst)).unwrap_or_default();
+            // return cast::Quality::from_qn(ctx.quality_qn.load(Ordering::SeqCst)).unwrap_or_default();
+            return ctx.caster.get_quality().unwrap_or_default();
         }
     }
     cast::Quality::default()

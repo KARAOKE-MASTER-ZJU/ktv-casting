@@ -1,12 +1,13 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
+// use tokio::sync::RwLock;
 use crate::bilibili_parser::{bv_to_aid, get_page_info};
+// use crate::cast;
 use super::progress::LocalProgressTracker;
 use super::{Capabilities, CastError, Caster, Progress, Quality, SongRef};
 
@@ -269,7 +270,7 @@ pub struct BilibiliCaster {
     device_buvid: String,
     progress: Arc<LocalProgressTracker>,
     // 保存配置项
-    quality: RwLock<Quality>,
+    quality: AtomicU32, // 使用 AtomicU32 保存清晰度的数值表示
     danmaku: AtomicBool,
 }
 
@@ -280,7 +281,7 @@ impl BilibiliCaster {
             mid: session.mid,
             device_buvid,
             progress: LocalProgressTracker::new(),
-            quality: RwLock::new(Quality::default()) ,
+            quality: AtomicU32::new(Quality::default().as_qn()) ,
             danmaku: AtomicBool::new(false),
         }
     }
@@ -402,7 +403,7 @@ impl Caster for BilibiliCaster {
         }
 
         // 获取 quality 读锁并拿到枚举，然后转为 qn 数值
-        let current_quality = self.quality.read().await.as_qn();
+        let current_quality = self.quality.load(Ordering::Relaxed);
         // 读取 AtomicBool 的当前值
         let current_danmaku = self.danmaku.load(Ordering::Relaxed);
 
@@ -472,6 +473,9 @@ impl Caster for BilibiliCaster {
         self.danmaku.store(on, Ordering::Relaxed);
         Ok(())
     }
+    fn get_danmaku(&self) -> Result<bool, CastError> {
+        Ok(self.danmaku.load(Ordering::Relaxed))
+    }
 
     // command=10：切换清晰度，与 main.py 的 cmd 10 一致。
     async fn set_quality(&self, quality: Quality) -> Result<(), CastError> {
@@ -479,9 +483,12 @@ impl Caster for BilibiliCaster {
             "qn": { "currentQn": { "quality": quality.as_qn() }, "userDesireQn": 0 }
         });
         self.send_cmd(10, 0, Some(extra), 0).await?;
-        let mut q = self.quality.write().await;
-        *q = quality;
+        self.quality.store(quality.as_qn(), Ordering::Relaxed);
         Ok(())
+    }
+
+    fn get_quality(&self) -> Result<Quality, CastError> {
+        Ok(Quality::from_qn(self.quality.load(Ordering::Relaxed)).unwrap_or_default())
     }
 
     fn capabilities(&self) -> Capabilities {

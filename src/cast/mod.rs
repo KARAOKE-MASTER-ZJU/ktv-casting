@@ -125,9 +125,15 @@ pub trait Caster: Send + Sync {
     async fn set_danmaku(&self, _on: bool) -> Result<(), CastError> {
         Err(CastError::Unsupported)
     }
+    fn get_danmaku(&self) -> Result<bool, CastError> {
+        Err(CastError::Unsupported)
+    }
 
     /// 切换清晰度。只有 Bilibili 投屏支持，其余 Caster 默认不支持。
     async fn set_quality(&self, _quality: Quality) -> Result<(), CastError> {
+        Err(CastError::Unsupported)
+    }
+    fn get_quality(&self) -> Result<Quality, CastError> {
         Err(CastError::Unsupported)
     }
 
