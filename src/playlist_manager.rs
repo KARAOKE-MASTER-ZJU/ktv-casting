@@ -400,13 +400,21 @@ impl PlaylistManager {
     }
 
     pub async fn next_song(&mut self) -> Result<(), String> {
-        let url = format!("{}/api/nextSong?roomId={}", self.url, self.room_id);
+        self.switch_song(true).await
+    }
+    pub async fn prev_song(&mut self) -> Result<(), String> {
+        self.switch_song(false).await
+    }
+
+    pub async fn switch_song(&mut self, next: bool) -> Result<(), String> {
+        let url = format!("{}/api/{}Song?roomId={}", self.url, if next {"next"} else {"prev"}, self.room_id);
         let temp_hash = self
             .hash
             .lock()
             .await
-            .clone()
-            .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
+            .as_deref()
+            .unwrap_or("EMPTY_LIST_HASH")
+            .to_string();
         let resp = self
             .client
             .post(&url)

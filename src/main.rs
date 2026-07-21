@@ -6,10 +6,7 @@ mod cli {
     use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
     use ktv_casting_lib::cast::bilibili_caster::{self as bili, BilibiliSession};
     use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
-    use ktv_casting_lib::{
-        ENGINE_STATE, cycle_quality_core, start_bilibili_engine_core, start_engine_core, toggle_danmaku_core,
-        toggle_pause_core, trigger_next_song, volume_down_core, volume_up_core,
-    };
+    use ktv_casting_lib::{ENGINE_STATE, cycle_quality_core, start_bilibili_engine_core, start_engine_core, toggle_danmaku_core, toggle_pause_core, trigger_next_song, trigger_prev_song, volume_down_core, volume_up_core};
     use log::{Log, Metadata, Record, info};
     use std::fmt::Write;
     use std::io;
@@ -74,6 +71,7 @@ mod cli {
         pb.set_draw_target(ProgressDrawTarget::stdout());
         println!("─────────────────────────────────────────");
         println!("  p      暂停 / 继续");
+        println!("  b      切上一首");
         println!("  n      切下一首");
         println!("  + / =  音量 +5");
         println!("  -      音量 -5");
@@ -227,9 +225,13 @@ mod cli {
                                     );
                                 }
                             }
+                            event::KeyCode::Char('b') => {
+                                trigger_prev_song();
+                                info!("⏮ 上一首");
+                            }
                             event::KeyCode::Char('n') => {
                                 trigger_next_song();
-                                info!("⏭ 切歌");
+                                info!("⏭ 下一首");
                             }
                             event::KeyCode::Char('+') | event::KeyCode::Char('=') => {
                                 match volume_up_core(VOLUME_STEP).await {
@@ -343,7 +345,7 @@ mod cli {
     }
 
     /// 负责进度查询、自动切歌，并通过回调更新 UI
-    async fn run_cli_monitor<FL, FP>(mut set_len: FL, mut set_pos: FP) -> anyhow::Result<()>
+    async fn run_cli_monitor<FL, FP>(mut set_len: FL, mut set_pos: FP) -> Result<()>
     where
         FL: FnMut(u64),
         FP: FnMut(u64),
@@ -380,7 +382,7 @@ mod cli {
                         && total_u64 > curr_u64
                         && (total_u64 - curr_u64) <= 2
                     {
-                        log::info!(">> 歌曲即将结束，自动切换下一首...");
+                        info!(">> 歌曲即将结束，自动切换下一首...");
                         let mut pm = ctx.playlist_manager.clone();
                         let _ = pm.next_song().await;
                         tokio::time::sleep(Duration::from_secs(5)).await;

@@ -241,11 +241,17 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryProgress(
     result_array.into_raw()
 }
 
-// 7. 控制接口：切歌
+// 7a. 控制接口：切歌(下一首)
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_nextSong(_env: JNIEnv, _class: JClass) {
     crate::trigger_next_song();
+}
+// 7b. 控制接口：切歌(上一首)
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_prevSong(_env: JNIEnv, _class: JClass) {
+    crate::trigger_prev_song();
 }
 
 // 8. 控制接口：播放/暂停 切换

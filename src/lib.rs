@@ -112,6 +112,17 @@ pub fn trigger_next_song() {
         }
     }
 }
+pub fn trigger_prev_song() {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            let ctx_task = Arc::clone(ctx);
+            ctx.rt.spawn(async move {
+                let mut pm = ctx_task.playlist_manager.clone();
+                let _ = pm.prev_song().await;
+            });
+        }
+    }
+}
 
 pub async fn jump_to_secs(target_secs: u32) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = {
