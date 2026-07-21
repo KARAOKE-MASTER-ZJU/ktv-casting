@@ -778,6 +778,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getCurrentSongTitle(
         .into_raw()
 }
 
+// 获取未播歌曲数量
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getQueuedSongsCount(
@@ -788,6 +789,23 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getQueuedSongsCount(
         if let Some(ctx) = guard.as_ref() {
             return ctx.rt.block_on(async {
                 ctx.playlist_manager.get_queued_count().await as jint
+            });
+        }
+    }
+    -1
+}
+
+// 获取未播歌曲数量
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getSungSongsCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if let Ok(guard) = ENGINE_STATE.read() {
+        if let Some(ctx) = guard.as_ref() {
+            return ctx.rt.block_on(async {
+                ctx.playlist_manager.get_sung_count().await as jint
             });
         }
     }
