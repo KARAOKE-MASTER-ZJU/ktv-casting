@@ -390,6 +390,9 @@ fn parse_song_ref(s: &str) -> (String, u32) {
 impl Caster for BilibiliCaster {
     async fn play_song(&self, song: &SongRef) -> Result<(), CastError> {
         let (bvid, page) = parse_song_ref(&song.0);
+        if !bvid.starts_with("BV") {
+            return Err(CastError::Unsupported);
+        }
         log::info!("[Bilibili] play_song: song_ref={}, parsed bvid={}, page={}", song.0, bvid, page);
 
         let aid = bv_to_aid(&bvid);
