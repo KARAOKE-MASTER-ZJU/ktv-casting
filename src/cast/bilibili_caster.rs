@@ -1,11 +1,11 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
-
+use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
+use tokio::sync::RwLock;
 use crate::bilibili_parser::{bv_to_aid, get_page_info};
 use super::progress::LocalProgressTracker;
 use super::{Capabilities, CastError, Caster, Progress, Quality, SongRef};
@@ -268,6 +268,9 @@ pub struct BilibiliCaster {
     mid: u64,
     device_buvid: String,
     progress: Arc<LocalProgressTracker>,
+    // 保存配置项
+    quality: RwLock<Quality>,
+    danmaku: AtomicBool,
 }
 
 impl BilibiliCaster {
@@ -277,6 +280,8 @@ impl BilibiliCaster {
             mid: session.mid,
             device_buvid,
             progress: LocalProgressTracker::new(),
+            quality: RwLock::new(Quality::default()) ,
+            danmaku: AtomicBool::new(false),
         }
     }
 
@@ -296,8 +301,9 @@ impl BilibiliCaster {
         .to_string();
 
         let mut full_extra = serde_json::json!({
+            "accessKey": self.access_token.as_str(),
             "autoNext": false, "biz_id": 6213332, "oid": oid,
-            "quality": 120, "userDesireSpeed": 1.0, "type": 101, "userVipInfo": 1
+            "userDesireSpeed": 1.0, "type": 101, "userVipInfo": 1
         });
         if let (Some(obj), Some(extra)) = (full_extra.as_object_mut(), extra_override.as_ref().and_then(|v| v.as_object())) {
             for (k, v) in extra {
@@ -395,24 +401,30 @@ impl Caster for BilibiliCaster {
             self.progress.start(duration).await;
         }
 
+        // 获取 quality 读锁并拿到枚举，然后转为 qn 数值
+        let current_quality = self.quality.read().await.as_qn();
+        // 读取 AtomicBool 的当前值
+        let current_danmaku = self.danmaku.load(Ordering::Relaxed);
+
         // 对于非第一页的视频，只在extra中传cid不传oid，但send_cmd仍需传aid
         let extra = if page != 0 {
             log::info!("[Bilibili] page != 0, only sending cid in extra (not oid) for multi-page video");
-            serde_json::json!({ "cid": cid, "type": 101 })
+            serde_json::json!({ "cid": cid, "type": 101, "quality": current_quality, "danmaku_switch": current_danmaku })
         } else {
-            serde_json::json!({ "oid": aid, "cid": cid, "type": 101 })
+            serde_json::json!({ "oid": aid, "cid": cid, "type": 101, "quality": current_quality, "danmaku_switch": current_danmaku })
         };
         log::info!("[Bilibili] sending play command: aid={}, cid={}, page={}, extra={}", aid, cid, page, extra);
         self.send_cmd(1, aid, Some(extra), 0).await?;
 
+        // 已保存状态，无需再次设置
         // 每次开始投屏都重置为默认状态：弹幕关闭、清晰度 1080P。
         // 设备侧没有读回接口，所以这里只能假定默认值，不要求成功才算播放成功。
-        if let Err(e) = self.set_danmaku(false).await {
-            log::warn!("[Bilibili] 设置默认弹幕状态失败: {}", e);
-        }
-        if let Err(e) = self.set_quality(Quality::default()).await {
-            log::warn!("[Bilibili] 设置默认清晰度失败: {}", e);
-        }
+        //if let Err(e) = self.set_danmaku(false).await {
+        //    log::warn!("[Bilibili] 设置默认弹幕状态失败: {}", e);
+        //}
+        //if let Err(e) = self.set_quality(Quality::default()).await {
+        //    log::warn!("[Bilibili] 设置默认清晰度失败: {}", e);
+        //}
 
         Ok(())
     }
@@ -460,7 +472,9 @@ impl Caster for BilibiliCaster {
 
     // command=9：弹幕开关，与 main.py 的 cmd 9 一致。
     async fn set_danmaku(&self, on: bool) -> Result<(), CastError> {
-        self.send_cmd(9, 0, Some(serde_json::json!({ "danmaku_switch": on })), 0).await
+        self.send_cmd(9, 0, Some(serde_json::json!({ "danmaku_switch": on })), 0).await?;
+        self.danmaku.store(on, Ordering::Relaxed);
+        Ok(())
     }
 
     // command=10：切换清晰度，与 main.py 的 cmd 10 一致。
@@ -468,7 +482,10 @@ impl Caster for BilibiliCaster {
         let extra = serde_json::json!({
             "qn": { "currentQn": { "quality": quality.as_qn() }, "userDesireQn": 0 }
         });
-        self.send_cmd(10, 0, Some(extra), 0).await
+        self.send_cmd(10, 0, Some(extra), 0).await?;
+        let mut q = self.quality.write().await;
+        *q = quality;
+        Ok(())
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -31,16 +31,20 @@ pub enum Quality {
     P480 = 32,
     P720 = 64,
     P1080 = 80,
+    P1080H = 112,
     P1080P60 = 116,
+    P4K = 120,
 }
 
 impl Quality {
-    pub const ALL: [Quality; 5] = [
+    pub const ALL: [Quality; 7] = [
         Quality::P360,
         Quality::P480,
         Quality::P720,
         Quality::P1080,
+        Quality::P1080H,
         Quality::P1080P60,
+        Quality::P4K,
     ];
 
     pub fn as_qn(self) -> u32 {
@@ -57,7 +61,9 @@ impl Quality {
             Quality::P480 => "480P",
             Quality::P720 => "720P",
             Quality::P1080 => "1080P",
+            Quality::P1080H => "1080PHigh",
             Quality::P1080P60 => "1080P60",
+            Quality::P4K => "4K",
         }
     }
 
