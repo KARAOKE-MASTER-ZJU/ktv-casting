@@ -406,13 +406,9 @@ impl Caster for BilibiliCaster {
         // 读取 AtomicBool 的当前值
         let current_danmaku = self.danmaku.load(Ordering::Relaxed);
 
-        // 对于非第一页的视频，只在extra中传cid不传oid，但send_cmd仍需传aid
-        let extra = if page != 0 {
-            log::info!("[Bilibili] page != 0, only sending cid in extra (not oid) for multi-page video");
-            serde_json::json!({ "cid": cid, "type": 101, "quality": current_quality, "danmaku_switch": current_danmaku })
-        } else {
-            serde_json::json!({ "oid": aid, "cid": cid, "type": 101, "quality": current_quality, "danmaku_switch": current_danmaku })
-        };
+        // extra的cid会被解析提取到外层
+        let extra = serde_json::json!({ "oid": aid, "cid": cid, "type": 101, "quality": current_quality, "danmaku_switch": current_danmaku });
+
         log::info!("[Bilibili] sending play command: aid={}, cid={}, page={}, extra={}", aid, cid, page, extra);
         self.send_cmd(1, aid, Some(extra), 0).await?;
 

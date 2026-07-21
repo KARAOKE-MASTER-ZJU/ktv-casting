@@ -94,11 +94,7 @@ pub async fn get_current_progress() -> (i32, i32) {
                 "progress: curr={} device_total={} cached_total={} playing={:?}",
                 p.current_secs, p.total_secs, cached_total, playing
             );
-            let total = if cached_total > 0 && cached_total != p.total_secs {
-                cached_total as i32
-            } else {
-                p.total_secs as i32
-            };
+            let total = if cached_total > 0 { cached_total } else { p.total_secs } as i32;
             (p.current_secs as i32, total)
         }
         Err(_) => (-1, -1),
@@ -240,11 +236,11 @@ pub async fn connect_room(
             let _ = c.play_song(&cast::SongRef(video_url.clone())).await;
 
             // 如果是 BV 视频，立刻从 bilibili API 获取时长并写入 cache
-            if let Some(bvid) = extract_bvid(&video_url) {
-                if let Ok((_, duration)) = crate::bilibili_parser::get_page_info(&bvid, 0).await {
+            if let Some((bvid,page)) = extract_bvid(&video_url) {
+                if let Ok((_, duration)) = crate::bilibili_parser::get_page_info(&bvid, page).await {
                     if duration > 0 {
                         cache.lock().await.insert(video_url, duration);
-                        debug!("[DLNA] 预填充 BV 视频时长到 cache: {} -> {}s", bvid, duration);
+                        debug!("预填充 BV 视频时长到 cache: {},p{} -> {}s", bvid, page+1, duration);
                     }
                 }
             }
@@ -271,10 +267,10 @@ pub async fn connect_room(
     Ok(())
 }
 
-fn extract_bvid(video_url: &str) -> Option<String> {
-    if let Some((bv, _)) = video_url.split_once("-page") {
+fn extract_bvid(video_url: &str) -> Option<(String,u32)> {
+    if let Some((bv, page)) = video_url.split_once("-page") {
         if bv.starts_with("BV") {
-            return Some(bv.to_string());
+            return Some((bv.to_string(),page.parse::<u32>().unwrap_or_default()));
         }
     }
     None
