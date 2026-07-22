@@ -52,6 +52,26 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initSessionDir(
     }
 }
 
+fn set_bili_auth_state(next: crate::BiliAuthState) {
+    if let Ok(mut state) = crate::BILI_AUTH_STATE.write() {
+        *state = next;
+    }
+}
+
+fn reset_bili_auth_state() {
+    set_bili_auth_state(crate::BiliAuthState::Idle);
+}
+
+fn current_bilibili_session() -> Option<crate::cast::bilibili_caster::BilibiliSession> {
+    use crate::{BILI_AUTH_STATE, BiliAuthState};
+
+    let state = BILI_AUTH_STATE.read().ok()?;
+    match &*state {
+        BiliAuthState::Success(session) => Some(session.clone()),
+        _ => None,
+    }
+}
+
 struct LogBridge {
     java_vm: JavaVM,
     rust_engine_class: GlobalRef,
@@ -516,29 +536,20 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startBilibiliQrLogin
     _class: JClass,
 ) {
     use crate::cast::bilibili_caster::login_qr;
-    use crate::{BILI_AUTH_STATE, BiliAuthState};
+    use crate::BiliAuthState;
+
+    reset_bili_auth_state();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let result = login_qr(|qr_url| {
-                if let Ok(mut s) = BILI_AUTH_STATE.write() {
-                    *s = BiliAuthState::AwaitingScan { qr_url };
-                }
+                set_bili_auth_state(BiliAuthState::AwaitingScan { qr_url });
             })
             .await;
-            if let Ok(mut s) = BILI_AUTH_STATE.write() {
-                match result {
-                    Ok(session) => {
-                        *s = BiliAuthState::Success {
-                            access_token: session.access_token,
-                            mid: session.mid,
-                        };
-                    }
-                    Err(e) => {
-                        *s = BiliAuthState::Error(e);
-                    }
-                }
+            match result {
+                Ok(session) => set_bili_auth_state(BiliAuthState::Success(session)),
+                Err(e) => set_bili_auth_state(BiliAuthState::Error(e)),
             }
         });
     });
@@ -576,7 +587,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getBilibiliLoginStat
         match &*s {
             BiliAuthState::Idle => -2,
             BiliAuthState::AwaitingScan { .. } => 0,
-            BiliAuthState::Success { .. } => 1,
+            BiliAuthState::Success(_) => 1,
             BiliAuthState::Error(_) => -1,
         }
     } else {
@@ -592,24 +603,19 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_listBilibiliDevices(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    use crate::cast::bilibili_caster::{list_devices, BilibiliSession};
-    use crate::{BILI_AUTH_STATE, BiliAuthState};
+    use crate::cast::bilibili_caster::{clear_session, list_devices};
 
-    let session = if let Ok(s) = BILI_AUTH_STATE.read() {
-        if let BiliAuthState::Success { access_token, mid } = &*s {
-            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid, expires_at: None })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
+    let session = current_bilibili_session();
     let json = if let Some(session) = session {
         let rt = tokio::runtime::Runtime::new().unwrap();
         match rt.block_on(list_devices(&session)) {
             Ok(devs) => serde_json::to_string(&devs).unwrap_or_else(|_| "[]".into()),
             Err(e) => {
+                if e.starts_with("auth expired:") {
+                    log::warn!("[Bilibili] 设备列表鉴权失效，清理当前会话: {}", e);
+                    let _ = clear_session();
+                    set_bili_auth_state(crate::BiliAuthState::Error("session expired".into()));
+                }
                 log::error!("listBilibiliDevices: {}", e);
                 "[]".into()
             }
@@ -634,6 +640,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_isBilibiliSessionExp
         if is_session_expired(&session) {
             log::warn!("[Bilibili] Token 已过期，清除 session");
             let _ = crate::cast::bilibili_caster::clear_session();
+            set_bili_auth_state(crate::BiliAuthState::Error("session expired".into()));
             return jboolean::from(true);
         }
     }
@@ -650,7 +657,10 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_clearBilibiliSession
     use crate::cast::bilibili_caster::clear_session;
 
     match clear_session() {
-        Ok(_) => jboolean::from(true),
+        Ok(_) => {
+            reset_bili_auth_state();
+            jboolean::from(true)
+        }
         Err(e) => {
             log::error!("[Bilibili] 清除 session 失败: {}", e);
             jboolean::from(false)
@@ -668,23 +678,11 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_startBilibiliEngine(
     room_id: JString,
     device_buvid: JString,
 ) {
-    use crate::cast::bilibili_caster::BilibiliSession;
-    use crate::{BILI_AUTH_STATE, BiliAuthState};
-
     let base_url_str: String = env.get_string(&base_url).unwrap().into();
     let room_id_str: String = env.get_string(&room_id).unwrap().into();
     let buvid_str: String = env.get_string(&device_buvid).unwrap().into();
 
-    let session = if let Ok(s) = BILI_AUTH_STATE.read() {
-        if let BiliAuthState::Success { access_token, mid } = &*s {
-            Some(BilibiliSession { access_token: access_token.clone(), mid: *mid, expires_at: None })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
+    let session = current_bilibili_session();
     let Some(session) = session else {
         log::error!("startBilibiliEngine: not logged in");
         return;
@@ -714,19 +712,9 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getBilibiliSessionJs
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    use crate::{BILI_AUTH_STATE, BiliAuthState};
-    use crate::cast::bilibili_caster::BilibiliSession;
-
-    let json = if let Ok(s) = BILI_AUTH_STATE.read() {
-        if let BiliAuthState::Success { access_token, mid } = &*s {
-            let session = BilibiliSession { access_token: access_token.clone(), mid: *mid, expires_at: None };
-            serde_json::to_string(&session).unwrap_or_default()
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
+    let json = current_bilibili_session()
+        .and_then(|session| serde_json::to_string(&session).ok())
+        .unwrap_or_default();
     env.new_string(json).unwrap().into_raw()
 }
 
@@ -739,18 +727,27 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_restoreBilibiliSessi
     _class: JClass,
     json: JString,
 ) -> jint {
-    use crate::{BILI_AUTH_STATE, BiliAuthState};
-    use crate::cast::bilibili_caster::BilibiliSession;
+    use crate::cast::bilibili_caster::{clear_session, is_session_expired, save_session, BilibiliSession};
 
     let json_str: String = env.get_string(&json).unwrap().into();
     if let Ok(session) = serde_json::from_str::<BilibiliSession>(&json_str) {
-        if let Ok(mut s) = BILI_AUTH_STATE.write() {
-            *s = BiliAuthState::Success { access_token: session.access_token, mid: session.mid };
+        if is_session_expired(&session) {
+            log::warn!("[Bilibili] 忽略已过期的恢复会话");
+            let _ = clear_session();
+            reset_bili_auth_state();
+            return 0;
         }
-        1
-    } else {
-        0
+        if let Err(e) = save_session(&session) {
+            log::error!("[Bilibili] 恢复会话落盘失败: {}", e);
+            reset_bili_auth_state();
+            return 0;
+        }
+
+        set_bili_auth_state(crate::BiliAuthState::Success(session));
+        return 1;
     }
+
+    0
 }
 
 // 12. 数据接口：获取当前歌曲标题

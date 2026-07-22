@@ -26,7 +26,7 @@ pub static BILI_AUTH_STATE: RwLock<BiliAuthState> = RwLock::new(BiliAuthState::I
 pub enum BiliAuthState {
     Idle,
     AwaitingScan { qr_url: String },
-    Success { access_token: String, mid: u64 },
+    Success(crate::cast::bilibili_caster::BilibiliSession),
     Error(String),
 }
 

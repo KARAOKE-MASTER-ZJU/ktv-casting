@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,61 @@ fn get_session_file() -> PathBuf {
     PathBuf::from(dir).join(TOKEN_FILE)
 }
 
+fn remove_session_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::info!("[Bilibili] Session 文件不存在，视为已清除: {}", path.display());
+            Ok(())
+        }
+        Err(e) => {
+            let err_msg = format!("清除 session 失败: {} (路径: {})", e, path.display());
+            log::error!("[Bilibili] {}", err_msg);
+            Err(err_msg)
+        }
+    }
+}
+
+fn is_auth_error(code: i64, message: &str) -> bool {
+    code == -101
+        || message.contains("未登录")
+        || message.to_ascii_lowercase().contains("access_key")
+        || message.to_ascii_lowercase().contains("token")
+}
+
+fn parse_devices_response(json: Value) -> Result<Vec<BilibiliDevice>, String> {
+    if let Some(code) = json["code"].as_i64() {
+        if code != 0 {
+            let message = json["message"]
+                .as_str()
+                .or_else(|| json["msg"].as_str())
+                .unwrap_or("unknown error");
+            let prefix = if is_auth_error(code, message) {
+                "auth expired"
+            } else {
+                "api error"
+            };
+            return Err(format!("{prefix}: code={code}, message={message}"));
+        }
+    }
+
+    let Some(arr) = json["data"]["devices"].as_array() else {
+        return Err("no devices array".into());
+    };
+
+    Ok(arr
+        .iter()
+        .filter_map(|d| {
+            Some(BilibiliDevice {
+                name: d["name"].as_str()?.into(),
+                brand: d["brand"].as_str()?.into(),
+                model: d["model"].as_str()?.into(),
+                buvid: d["buvid"].as_str()?.into(),
+            })
+        })
+        .collect())
+}
+
 pub fn save_session(session: &BilibiliSession) -> Result<(), String> {
     let json = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
     let path = get_session_file();
@@ -227,11 +282,7 @@ pub fn is_session_expired(session: &BilibiliSession) -> bool {
 
 pub fn clear_session() -> Result<(), String> {
     let path = get_session_file();
-    std::fs::remove_file(&path).map_err(|e| {
-        let err_msg = format!("清除 session 失败: {} (路径: {})", e, path.display());
-        log::error!("[Bilibili] {}", err_msg);
-        err_msg
-    })?;
+    remove_session_file(&path)?;
     log::info!("[Bilibili] Session 已清除: {}", path.display());
     Ok(())
 }
@@ -250,18 +301,7 @@ pub async fn list_devices(session: &BilibiliSession) -> Result<Vec<BilibiliDevic
         .await
         .map_err(|e| e.to_string())?;
 
-    let arr = json["data"]["devices"].as_array().ok_or("no devices array")?;
-    Ok(arr
-        .iter()
-        .filter_map(|d| {
-            Some(BilibiliDevice {
-                name: d["name"].as_str()?.into(),
-                brand: d["brand"].as_str()?.into(),
-                model: d["model"].as_str()?.into(),
-                buvid: d["buvid"].as_str()?.into(),
-            })
-        })
-        .collect())
+    parse_devices_response(json)
 }
 
 pub struct BilibiliCaster {
@@ -500,5 +540,30 @@ impl Caster for BilibiliCaster {
             seek: true,
             hardware_progress: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_devices_response, remove_session_file};
+    use serde_json::json;
+    use std::path::Path;
+
+    #[test]
+    fn clear_session_treats_missing_file_as_success() {
+        let path = Path::new("/tmp/ktv-casting-nonexistent-session.json");
+        assert!(remove_session_file(path).is_ok());
+    }
+
+    #[test]
+    fn parse_devices_response_surfaces_auth_expiry() {
+        let err = parse_devices_response(json!({
+            "code": -101,
+            "message": "账号未登录"
+        }))
+        .unwrap_err();
+
+        assert!(err.starts_with("auth expired:"));
+        assert!(err.contains("账号未登录"));
     }
 }
