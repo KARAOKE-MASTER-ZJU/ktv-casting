@@ -2,11 +2,12 @@ use crate::cast::dlna_caster::DlnaCaster;
 use crate::dlna_controller::{DlnaController, DlnaDevice};
 use crate::playlist_manager::PlaylistManager;
 use actix_web::{App, HttpServer, web};
-use log::{info, debug};
+use log::{info, debug, warn};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, /*AtomicU32,*/ Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 #[cfg(target_os = "android")]
 pub mod android;
@@ -19,6 +20,9 @@ pub mod mp4_util;
 pub mod playlist_manager;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
+
+/// DLNA 媒体代理服务器的关闭信号。
+static MEDIA_SERVER_SHUTDOWN: RwLock<Option<Arc<Notify>>> = RwLock::new(None);
 
 /// Shared state for the Bilibili QR login flow (polled by Android UI / CLI).
 pub static BILI_AUTH_STATE: RwLock<BiliAuthState> = RwLock::new(BiliAuthState::Idle);
@@ -74,8 +78,12 @@ pub(crate) fn get_best_local_ip(target_device_ip: &str) -> String {
 
 pub fn reset_engine() {
     if let Ok(mut guard) = ENGINE_STATE.write() {
-        info!("释放引擎资源...");
         *guard = None;
+    }
+    if let Ok(mut guard) = MEDIA_SERVER_SHUTDOWN.write() {
+        if let Some(notify) = guard.take() {
+            notify.notify_one();
+        }
     }
 }
 
@@ -145,7 +153,6 @@ pub async fn start_engine_core(
         if guard.is_some() {
             info!("检测到旧引擎正在运行，正在重置...");
             *guard = None;
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     }
 
@@ -201,7 +208,33 @@ pub async fn connect_dlna_device(
         duration_cache: cache.clone(),
         eplus_auth: Arc::new(tokio::sync::Mutex::new(None)),
     });
-    let port = 8080u16;
+    // 通知旧服务器关闭（防止端口冲突）
+    if let Ok(mut guard) = MEDIA_SERVER_SHUTDOWN.write() {
+        if let Some(notify) = guard.take() {
+            notify.notify_one();
+        }
+    }
+
+    // 优先使用已验证的 8080，被占用时回退到内核分配
+    let (listener, port) = match std::net::TcpListener::bind("0.0.0.0:8080") {
+        Ok(l) => {
+            info!("媒体服务器绑定端口 8080");
+            (l, 8080)
+        }
+        Err(_) => {
+            warn!("端口 8080 被占用（可能被 Kodi WebUI 等服务使用），由内核分配可用端口");
+            let l = std::net::TcpListener::bind("0.0.0.0:0")?;
+            let p = l.local_addr()?.port();
+            warn!("媒体服务器改用端口 {}", p);
+            (l, p)
+        }
+    };
+
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = shutdown.clone();
+    if let Ok(mut guard) = MEDIA_SERVER_SHUTDOWN.write() {
+        *guard = Some(shutdown);
+    }
 
     let shared_state_clone = shared_state.clone();
     handle.spawn(async move {
@@ -212,12 +245,17 @@ pub async fn connect_dlna_device(
                 .app_data(shared_state_clone.clone())
                 .service(media_server::proxy_handler)
         };
-        let _ = HttpServer::new(app_factory)
+        let server = HttpServer::new(app_factory)
             .workers(1)
-            .bind(("0.0.0.0", port))
-            .unwrap()
-            .run()
-            .await;
+            .listen(listener)
+            .expect("使用预绑定 listener 不应失败")
+            .run();
+        tokio::select! {
+            _ = server => {},
+            _ = shutdown_clone.notified() => {
+                info!("媒体服务器收到关闭信号，正在停止...");
+            },
+        }
     });
 
     let local_ip_addr: std::net::IpAddr = get_best_local_ip(target_ip).parse().unwrap();
