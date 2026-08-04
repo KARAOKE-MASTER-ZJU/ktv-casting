@@ -240,8 +240,14 @@ pub async fn connect_dlna_device(
     handle.spawn(async move {
         info!("正在启动媒体服务器...");
         let app_factory = move || {
+            // 媒体代理 client：只限制连接建立阶段，避免上游连接挂起导致设备拉流卡死
+            // （流式响应本身不能设整体 timeout，否则长视频会被掐断）
+            let proxy_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("创建媒体代理 HTTP 客户端失败");
             App::new()
-                .app_data(web::Data::new(reqwest::Client::new()))
+                .app_data(web::Data::new(proxy_client))
                 .app_data(shared_state_clone.clone())
                 .service(media_server::proxy_handler)
         };

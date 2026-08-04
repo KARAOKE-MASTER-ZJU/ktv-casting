@@ -7,8 +7,44 @@ use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::IpAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
+
+/// SOAP 请求超时（秒）。所有 AVTransport / RenderingControl 调用都必须有界，
+/// 否则设备一旦不响应，JNI 层 `ctx.rt.block_on(...)` / CLI 键盘 `rt.block_on(...)`
+/// 会无限期挂起 —— App 主线程 ANR / 闪退，CLI 假死。
+const SOAP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 兼容模式的单次请求超时。兼容模式会尝试多个候选 control 路径，
+/// 若每个都用 3s 会让一次操作在最坏情况下拖到十几秒（对 App 主线程仍是 ANR 风险）。
+/// 正常设备在局域网内响应都在百毫秒级，1.5s 足够。
+const SOAP_TIMEOUT_COMPAT: Duration = Duration::from_millis(1500);
+
+/// 全局复用的 SOAP HTTP 客户端：连接池复用 + 统一超时。
+/// 修复前：每次 action 都新建 reqwest Client（新 TCP 连接），配合 1s 一次的
+/// GetPositionInfo 轮询，等于每秒向设备开一条新连接，长时间运行会打崩设备
+/// 的 UPnP 服务（导致其停止响应）。
+fn soap_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(SOAP_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()
+            .expect("创建 SOAP HTTP 客户端失败")
+    })
+}
+
+/// 给 rupnp action future 加超时。设备不响应时返回超时错误，而不是永久等待。
+async fn timeout_soap<T>(fut: impl Future<Output = Result<T, rupnp::Error>>) -> Result<T, rupnp::Error> {
+    match timeout(SOAP_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(rupnp::Error::ParseError("SOAP 调用超时")),
+    }
+}
 
 fn extract_xml_tag_value(xml: &str, tag: &str) -> Option<String> {
     // 解析XML标签值，支持带命名空间属性的标签
@@ -115,40 +151,100 @@ fn log_upnp_action(service: &rupnp::Service, base_url: &Uri, action: &str, args_
     log::debug!("UPnP Action body (approx) => {}", envelope);
 }
 
+/// 从 SOAP 响应 XML 中解析本项目关心的字段。
+fn parse_soap_response_fields(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for k in [
+        "Track",
+        "TrackDuration",
+        "TrackMetaData",
+        "TrackURI",
+        "RelTime",
+        "AbsTime",
+        "RelCount",
+        "AbsCount",
+    ] {
+        if let Some(v) = extract_xml_tag_value(text, k) {
+            log::debug!("提取到字段 '{}' 的值: '{}'", k, v);
+            out.insert(k.to_string(), v);
+        }
+    }
+    log::debug!("解析后的响应字段: {:?}", out);
+    out
+}
+
+/// 用全局共享 client（连接池复用 + 统一超时）发送一次 SOAP 请求到指定 URL。
+/// 这是主要 SOAP 通道：避免 rupnp 原生 action 每次新建 TCP 连接、每秒打一次设备，
+/// 长时间运行把设备 UPnP 服务打崩。
+async fn send_soap_shared(
+    final_url: &str,
+    action: &str,
+    args_xml: &str,
+    timeout: Duration,
+) -> Result<HashMap<String, String>, rupnp::Error> {
+    let soap_action_header =
+        format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
+    let body = build_soap_envelope(action, args_xml);
+
+    log::debug!("UPnP Action (shared) -> url={} SOAPAction={}", final_url, soap_action_header);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "SOAPAction",
+        HeaderValue::from_str(&soap_action_header)
+            .map_err(|_| rupnp::Error::ParseError("SOAPAction header非法"))?,
+    );
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/xml; charset=\"utf-8\""),
+    );
+
+    let resp = soap_client()
+        .post(final_url)
+        .timeout(timeout)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(rupnp::Error::invalid_response)?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(rupnp::Error::invalid_response)?;
+
+    if status.as_u16() == 200 {
+        log::info!("UPnP Action (shared) succeeded with url: {}", final_url);
+        log::debug!("UPnP Action (shared) status=200 body={}", text);
+        Ok(parse_soap_response_fields(&text))
+    } else {
+        log::warn!(
+            "UPnP Action (shared) failed with url {}: status={} body={}",
+            final_url,
+            status,
+            text
+        );
+        Err(rupnp::Error::HttpErrorCode(status))
+    }
+}
+
 /// Some renderers publish a `controlURL` like `_urn:schemas-upnp-org:service:AVTransport_control`
 /// (missing the leading `/`). In practice the working endpoint is often `/_urn:...`.
 ///
 /// `rupnp`'s internal URL replacement may produce the wrong path for such devices.
 /// To make behavior explicit (and loggable), we send the SOAP request ourselves to:
-/// `{scheme}://{host}:{port}/{control_path}`.
+/// `{scheme}://{host}:{port}/{control_path}`。
+///
+/// 发送顺序（都带超时，设备不响应时优雅降级而不是无限等待）：
+///   1. 首选：从 Service Debug 提取 control endpoint，用共享 client 发送（连接池复用）
+///   2. 兜底：rupnp 原生 action（Debug 解析失败的设备；每次新建连接，尽量少走）
+///   3. 最后：常见 control 路径遍历（共享 client，短超时）
 async fn avtransport_action_compat(
     service: &rupnp::Service,
     base_url: &Uri,
     action: &str,
     args_xml: &str,
 ) -> Result<HashMap<String, String>, rupnp::Error> {
-    // 首先尝试使用 rupnp 原生的 action 方法（适用于Windows Media Player等标准设备）
-    match service.action(base_url, action, args_xml).await {
-        Ok(response) => {
-            log::debug!("UPnP Action (native) succeeded");
-            log::debug!("UPnP Action (native) response: {:?}", response);
-            return Ok(response);
-        }
-        Err(e) => {
-            log::warn!(
-                "UPnP Action (native) failed: {}, trying compatibility mode",
-                e
-            );
-        }
-    }
-
-    // 原生方法失败，尝试兼容性模式
-
-    // 从 debug 输出中我们可以看到 service 的结构
-    // 我们可以通过 Debug 表示式提取 control_endpoint 信息
-    let service_debug = format!("{:?}", service);
-    log::debug!("Service Debug info: {}", service_debug);
-
     let host = base_url
         .host()
         .ok_or(rupnp::Error::ParseError("base_url缺少host"))?
@@ -160,12 +256,39 @@ async fn avtransport_action_compat(
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
-    // 候选控制路径：优先使用 debug 中的 control_endpoint，并补充常见路径
-    let mut possible_paths: Vec<String> = Vec::new();
+    let service_debug = format!("{:?}", service);
 
+    // 1) 首选：Debug 提取 control endpoint，走共享 client（连接复用，避免每秒新建连接打崩设备）
     if let Some(path) = extract_control_endpoint_from_debug(&service_debug) {
-        possible_paths.push(normalize_control_path(&path));
+        let p = normalize_control_path(&path);
+        let final_url = if p.starts_with("http://") || p.starts_with("https://") {
+            p
+        } else {
+            format!("{}://{}:{}{}", scheme, host, port, p)
+        };
+        if let Ok(response) = send_soap_shared(&final_url, action, args_xml, SOAP_TIMEOUT).await {
+            return Ok(response);
+        }
     }
+
+    // 2) 兜底：rupnp 原生 action（每次新建连接，仅用于 Debug 解析失败/路径不匹配的设备）
+    match timeout_soap(service.action(base_url, action, args_xml)).await {
+        Ok(response) => {
+            log::debug!("UPnP Action (native) succeeded");
+            log::debug!("UPnP Action (native) response: {:?}", response);
+            return Ok(response);
+        }
+        Err(e) => {
+            log::warn!(
+                "UPnP Action (native) failed: {}, trying common control paths",
+                e
+            );
+        }
+    }
+
+    // 3) 最后兜底：常见 control 路径遍历（共享 client，短超时）
+    log::debug!("Service Debug info: {}", service_debug);
+    let mut possible_paths: Vec<String> = Vec::new();
 
     // 尝试从 debug 中解析出真实的控制路径（常见于 Windows UPnP Host）
     if let Some(start) = service_debug.find("/upnphost/udhisapi.dll?control=")
@@ -187,88 +310,14 @@ async fn avtransport_action_compat(
         .map(normalize_control_path), // 规范化路径,增加/
     );
 
-    // 尝试匹配可能的路径模式
     for path in possible_paths {
         let final_url = if path.starts_with("http://") || path.starts_with("https://") {
             path
         } else {
             format!("{}://{}:{}{}", scheme, host, port, path)
         };
-
-        let soap_action_header =
-            format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
-        let body = build_soap_envelope(action, args_xml);
-
-        log::info!(
-            "UPnP Action (compat) -> url={} SOAPAction={}",
-            final_url,
-            soap_action_header
-        );
-        log::debug!("UPnP Action (compat) body => {}", body);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "SOAPAction",
-            HeaderValue::from_str(&soap_action_header)
-                .map_err(|_| rupnp::Error::ParseError("SOAPAction header非法"))?,
-        );
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/xml; charset=\"utf-8\""),
-        );
-
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|_| rupnp::Error::ParseError("创建reqwest client失败"))?;
-
-        match client
-            .post(&final_url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.map_err(|e| {
-                    rupnp::Error::ParseError(Box::leak(
-                        format!("读取SOAP响应失败: {}", e).into_boxed_str(),
-                    ))
-                })?;
-
-                if status.as_u16() == 200 {
-                    log::info!("UPnP Action (compat) succeeded with path: {}", final_url);
-                    log::debug!("UPnP Action (compat) status=200 body={}", text);
-
-                    let mut out = HashMap::new();
-                    for k in [
-                        "Track",
-                        "TrackDuration",
-                        "TrackMetaData",
-                        "TrackURI",
-                        "RelTime",
-                        "AbsTime",
-                        "RelCount",
-                        "AbsCount",
-                    ] {
-                        if let Some(v) = extract_xml_tag_value(&text, k) {
-                            log::debug!("提取到字段 '{}' 的值: '{}'", k, v);
-                            out.insert(k.to_string(), v);
-                        }
-                    }
-
-                    log::debug!("解析后的响应字段: {:?}", out);
-                    return Ok(out);
-                } else {
-                    log::warn!(
-                        "UPnP Action (compat) failed with path {}: status={} body={}",
-                        final_url,
-                        status,
-                        text
-                    );
-                }
-            }
+        match send_soap_shared(&final_url, action, args_xml, SOAP_TIMEOUT_COMPAT).await {
+            Ok(response) => return Ok(response),
             Err(e) => {
                 log::warn!("UPnP Action (compat) failed with path {}: {}", final_url, e);
             }
@@ -792,9 +841,7 @@ impl DlnaController {
             )
         );
 
-        let response = rendering_control
-            .action(&base_url, action, &args_str)
-            .await?;
+        let response = timeout_soap(rendering_control.action(&base_url, action, &args_str)).await?;
         log::debug!("SetVolume响应: {:?}", response);
 
         Ok(())
@@ -837,9 +884,7 @@ impl DlnaController {
             )
         );
 
-        let response = rendering_control
-            .action(&base_url, action, args_str)
-            .await?;
+        let response = timeout_soap(rendering_control.action(&base_url, action, args_str)).await?;
 
         // 解析音量值
         let default_volume = "0".to_string();

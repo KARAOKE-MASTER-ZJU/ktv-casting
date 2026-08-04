@@ -415,6 +415,65 @@ RUST_LOG=info,ktv_casting_lib=debug cargo run
 
 ---
 
+## 已知问题与排查记录
+
+### [2026-08-03] DLNA 模式暂停失效 + App 闪退（复现中）
+
+**现象**
+- CLI（`cargo run --release`，DLNA 模式选小电视，房间 111）：一开始暂停/恢复正常，播放一段时间后按 `p` 无响应
+- Android App 同样问题，且主线程卡死在 native（ANR）后进程被杀（闪退）
+- 设备：B站小电视 `http://<IP>:9958/bilibili/description.xml`；本机环境日志见 `debuglog.txt`
+
+**根因（两个叠加缺陷）**
+
+1. **SOAP 调用无超时 → 闪退的直接原因**
+   - rupnp `Service::action()` 和 compat 路径的 reqwest 请求都没有 `.timeout()`。
+   - 小电视不响应时 `await` **永久挂起**。
+   - App JNI 层（`src/android.rs`）在持有 `ENGINE_STATE` 读锁的情况下 `ctx.rt.block_on(...)` 同步等待 —— 主线程永久卡死 → ANR → 进程被杀（闪退）。
+   - `debuglog.txt` 里 Signal Catcher 收到 SIGQUIT 后 `libbacktrace: Timed out waiting for signal handler`，确认主线程卡死在 native 无法响应。
+
+2. **每次 SOAP 调用新建 TCP 连接 → 播放一段时间后设备被打崩**
+   - rupnp `action()` 每次内部 `Client::builder(...).build_http()`；进度轮询每秒一次 GetPositionInfo = **每秒向设备开一条新 TCP 连接**。
+   - 长时间运行耗尽设备 UPnP 服务连接容量，设备停止响应 → 触发缺陷 1。
+
+**完整因果链（从 UI 到闪退）**
+
+```
+Java UI 线程
+  → JNI: RustEngine_togglePause()              // src/android.rs:281
+    → ENGINE_STATE.read()                       // 持有读锁
+      → ctx.rt.block_on(toggle_pause_core())    // 同步阻塞，等 async 完成
+        → caster.pause()                        // Caster trait
+          → DlnaCaster::pause()                 // src/cast/dlna_caster.rs:45
+            → controller.pause(&device)         // src/dlna_controller.rs:597
+              → avtransport_action_compat(...)  // 发 SOAP Pause 请求
+                → service.action(...).await     // ❌ 没有 .timeout()
+                  或
+                → reqwest::Client::post(...).send().await  // ❌ 也没有 .timeout()
+```
+
+`service.action().await` 内部 `Client::builder().build_http().request(...)` 每次新建 TCP 连接且无超时。
+设备不响应 → `await` 永不返回 → `block_on` 永不返回 → 读锁永不释放 → **Java 主线程卡死在 native**。
+
+Android 系统 5 秒后检测到主线程无响应 → ANR → 发送 SIGQUIT 采集 backtrace
+→ 但线程卡在 `block_on` 里连信号都处理不了 → `libbacktrace: Timed out waiting for signal handler`
+→ 进程被杀（闪退）。
+
+CLI 同理：键盘事件处理器 `rt.block_on(...)` 卡死 → 终端假死，按 `p` 无反应。
+
+**修复（`git diff` 可见）**
+
+| 修复 | 文件 | 说明 |
+|------|------|------|
+| SOAP 全链路超时 | `src/dlna_controller.rs` | `timeout_soap()` 包裹 native action + RenderingControl 调用（3s），兼容模式单请求 1.5s；设备不响应时返回错误而非永久挂起 |
+| 连接复用 | `src/dlna_controller.rs` | 新增全局 `soap_client()`（连接池 + 超时），`avtransport_action_compat` 首选走共享 client；rupnp native action 降为兜底。消除每秒新建连接的根源 |
+| CLI 错误可见 | `src/main.rs` | 暂停失败时 `warn!` 打日志（原静默吞掉），锁污染时恢复而非 panic |
+| 防御性修复 | `src/lib.rs` / `src/playlist_manager.rs` | 媒体代理 `connect_timeout(10s)`；WS 重连前 `sleep(3s)` 退避 |
+
+**验证（真实小电视 + 房间 111，13 分钟长跑，3 首歌）**：暂停 49 次全成功，0 次 SOAP 超时，连接复用 100%。
+
+---
+
 ## 贡献与开发建议
 
 - 优先把"可复现问题"的抓包（pcap）和日志（`RUST_LOG=debug`）一起提交

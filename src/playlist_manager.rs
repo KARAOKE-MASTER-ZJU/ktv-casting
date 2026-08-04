@@ -275,6 +275,8 @@ impl PlaylistManager {
                     Ok(val) => val,
                     Err(e) => {
                         error!("连接 WebSocket 失败: {}", e);
+                        // 避免紧密重连循环，等待后重试
+                        tokio::time::sleep(Duration::from_secs(3)).await;
                         continue;
                     }
                 };

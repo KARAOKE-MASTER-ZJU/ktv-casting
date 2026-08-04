@@ -7,7 +7,7 @@ mod cli {
     use ktv_casting_lib::cast::bilibili_caster::{self as bili, BilibiliSession};
     use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
     use ktv_casting_lib::{ENGINE_STATE, cycle_quality_core, start_bilibili_engine_core, start_engine_core, toggle_danmaku_core, toggle_pause_core, trigger_next_song, trigger_prev_song, volume_down_core, volume_up_core};
-    use log::{Log, Metadata, Record, info};
+    use log::{Log, Metadata, Record, info, warn};
     use std::fmt::Write;
     use std::io;
     use std::time::Duration;
@@ -214,15 +214,18 @@ mod cli {
                     rt.block_on(async {
                         match key.code {
                             event::KeyCode::Char('p') => {
-                                if let Ok(state) = toggle_pause_core().await {
-                                    info!(
-                                        "{}",
-                                        if state {
-                                            "▶ 已恢复播放"
-                                        } else {
-                                            "⏸ 已暂停"
-                                        }
-                                    );
+                                match toggle_pause_core().await {
+                                    Ok(state) => {
+                                        info!(
+                                            "{}",
+                                            if state {
+                                                "▶ 已恢复播放"
+                                            } else {
+                                                "⏸ 已暂停"
+                                            }
+                                        );
+                                    }
+                                    Err(e) => warn!("暂停/恢复失败: {}", e),
                                 }
                             }
                             event::KeyCode::Char('b') => {
@@ -354,7 +357,8 @@ mod cli {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
             let ctx = {
-                let guard = ENGINE_STATE.read().unwrap();
+                // 锁被污染（其他线程 panic）时恢复而非 panic 退出整个 CLI
+                let guard = ENGINE_STATE.read().unwrap_or_else(|e| e.into_inner());
                 guard.as_ref().cloned()
             };
 
