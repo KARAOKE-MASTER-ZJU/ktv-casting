@@ -5,14 +5,14 @@ permissions:
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
     # tags: [ "v*" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: ktv-casting
+  BIN_NAME: ktv-cli
 
 jobs:
   build-and-upload:
