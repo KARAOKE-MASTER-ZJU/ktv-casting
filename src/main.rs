@@ -388,7 +388,9 @@ mod cli {
                     {
                         info!(">> 歌曲即将结束，自动切换下一首...");
                         let mut pm = ctx.playlist_manager.clone();
-                        let _ = pm.next_song().await;
+                        if let Err(e) = pm.next_song().await {
+                            warn!("自动切歌失败: {}", e);
+                        }
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }

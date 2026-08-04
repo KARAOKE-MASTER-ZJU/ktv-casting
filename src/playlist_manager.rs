@@ -30,6 +30,7 @@ impl PlaylistManager {
         // 在初始化时构建一次 Client
         let client = Client::builder()
             .use_rustls_tls()
+            .timeout(crate::API_TIMEOUT)
             .build()
             .expect("构建 HTTP 客户端失败");
         Self {

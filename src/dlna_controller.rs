@@ -12,15 +12,16 @@ use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// SOAP 请求超时（秒）。所有 AVTransport / RenderingControl 调用都必须有界，
-/// 否则设备一旦不响应，JNI 层 `ctx.rt.block_on(...)` / CLI 键盘 `rt.block_on(...)`
-/// 会无限期挂起 —— App 主线程 ANR / 闪退，CLI 假死。
-const SOAP_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// 兼容模式的单次请求超时。兼容模式会尝试多个候选 control 路径，
-/// 若每个都用 3s 会让一次操作在最坏情况下拖到十几秒（对 App 主线程仍是 ANR 风险）。
-/// 正常设备在局域网内响应都在百毫秒级，1.5s 足够。
+/// 兼容模式的单次请求超时。正常设备在局域网内响应在百毫秒级，1.5s 足够；
+/// 更短是为了避免候选 control 路径全量轮询时累加超过 ANR 阈值。
 const SOAP_TIMEOUT_COMPAT: Duration = Duration::from_millis(1500);
+const _: () = assert!(SOAP_TIMEOUT_COMPAT.as_millis() < crate::ANR_DEADLINE.as_millis() as u128,
+    "SOAP_TIMEOUT_COMPAT 必须小于 ANR_DEADLINE");
+
+/// 设备发现/连接超时。SSDP/HTTP 描述文件获取不应阻塞过久。
+const DEVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const _: () = assert!(DEVICE_DISCOVERY_TIMEOUT.as_secs() < crate::ANR_DEADLINE.as_secs(),
+    "DEVICE_DISCOVERY_TIMEOUT 必须小于 ANR_DEADLINE");
 
 /// 全局复用的 SOAP HTTP 客户端：连接池复用 + 统一超时。
 /// 修复前：每次 action 都新建 reqwest Client（新 TCP 连接），配合 1s 一次的
@@ -31,7 +32,7 @@ fn soap_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .no_proxy()
-            .timeout(SOAP_TIMEOUT)
+            .timeout(crate::SOAP_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .expect("创建 SOAP HTTP 客户端失败")
@@ -40,7 +41,7 @@ fn soap_client() -> &'static reqwest::Client {
 
 /// 给 rupnp action future 加超时。设备不响应时返回超时错误，而不是永久等待。
 async fn timeout_soap<T>(fut: impl Future<Output = Result<T, rupnp::Error>>) -> Result<T, rupnp::Error> {
-    match timeout(SOAP_TIMEOUT, fut).await {
+    match timeout(crate::SOAP_TIMEOUT, fut).await {
         Ok(r) => r,
         Err(_) => Err(rupnp::Error::ParseError("SOAP 调用超时")),
     }
@@ -266,7 +267,7 @@ async fn avtransport_action_compat(
         } else {
             format!("{}://{}:{}{}", scheme, host, port, p)
         };
-        if let Ok(response) = send_soap_shared(&final_url, action, args_xml, SOAP_TIMEOUT).await {
+        if let Ok(response) = send_soap_shared(&final_url, action, args_xml, crate::SOAP_TIMEOUT).await {
             return Ok(response);
         }
     }
@@ -436,7 +437,7 @@ impl DlnaController {
         let tasks = urls.iter().map(|url| {
             let uri =Uri::from_static(url);
             async move {
-                match timeout(Duration::from_secs(3), Device::from_url(uri)).await {
+                match timeout(DEVICE_DISCOVERY_TIMEOUT, Device::from_url(uri)).await {
                     Ok(Ok(device)) => Some(device), // 成功获取
                     Ok(Err(e)) => {
                         log::error!("解析 URL 失败 [{}]: {}", url, e);
@@ -475,7 +476,7 @@ impl DlnaController {
             .map_err(|_| rupnp::Error::ParseError("无法解析设备XML URL"))?;
         log::info!("正在通过URL直接获取设备: {}", url);
 
-        let device = timeout(Duration::from_secs(3), Device::from_url(uri))
+        let device = timeout(DEVICE_DISCOVERY_TIMEOUT, Device::from_url(uri))
             .await
             .map_err(|_| rupnp::Error::ParseError("连接设备或获取描述文件超时"))??;
 

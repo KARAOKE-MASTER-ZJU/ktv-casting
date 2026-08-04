@@ -1,5 +1,21 @@
 use reqwest::Client;
 use serde_json::Value;
+use std::sync::OnceLock;
+
+/// 全局共享 B站 API 客户端：连接池复用 + 超时。
+/// 超时值来自 `crate::API_TIMEOUT`，编译期保证 < ANR 阈值（5s）。
+/// 修复前每次调用 `Client::new()` 都新建 TCP 连接，B站 API 卡住时无超时
+/// 永久挂起 → block_on 死锁 → ANR / 闪退。
+fn bili_api_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(crate::API_TIMEOUT)
+            .user_agent("Mozilla/5.0")
+            .build()
+            .expect("创建 B站 API 客户端失败")
+    })
+}
 
 // 新算法 (2020-03+): https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/bvid_desc.html
 const BV_XOR_CODE: u64 = 23442827791579;
@@ -23,11 +39,9 @@ pub fn bv_to_aid(bvid: &str) -> u64 {
 
 /// Returns `(cid, duration_secs)` for the given page of a BV video.
 pub async fn get_page_info(bv_id: &str, page: u32) -> Result<(u64, u32), String> {
-    let client = Client::new();
     let url = format!("https://api.bilibili.com/x/player/pagelist?bvid={}", bv_id);
-    let json: Value = client
+    let json: Value = bili_api_client()
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -57,7 +71,6 @@ pub async fn get_page_duration(bv_id: &str, page: u32) -> Result<u32, String> {
 /// # Returns
 /// * `Result<String, String>` - 返回直链URL或错误信息
 pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<String, String> {
-    let client = Client::new();
     let page = page.unwrap_or(0);
 
     //如果bv_id本来就是一个URL，直接返回
@@ -66,19 +79,18 @@ pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<
     }
 
     // 第一步：获取CID
-    let cid = get_video_cid(&client, bv_id, page).await?;
+    let cid = get_video_cid(bv_id, page).await?;
 
     // 第二步：获取视频直链
-    get_video_url(&client, bv_id, &cid).await
+    get_video_url(bv_id, &cid).await
 }
 
 /// 获取视频的CID（分集ID）
-async fn get_video_cid(client: &Client, bv_id: &str, page: u32) -> Result<String, String> {
+async fn get_video_cid(bv_id: &str, page: u32) -> Result<String, String> {
     let url = format!("https://api.bilibili.com/x/player/pagelist?bvid={}", bv_id);
 
-    let response = client
+    let response = bili_api_client()
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
         .map_err(|e| format!("请求CID失败: {}", e))?;
@@ -128,15 +140,14 @@ async fn get_video_cid(client: &Client, bv_id: &str, page: u32) -> Result<String
 }
 
 /// 获取视频播放链接
-async fn get_video_url(client: &Client, bv_id: &str, cid: &str) -> Result<String, String> {
+async fn get_video_url(bv_id: &str, cid: &str) -> Result<String, String> {
     let url = format!(
         "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=116&type=&otype=json&platform=html5&high_quality=1",
         bv_id, cid
     );
 
-    let response = client
+    let response = bili_api_client()
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
         .map_err(|e| format!("请求视频链接失败: {}", e))?;

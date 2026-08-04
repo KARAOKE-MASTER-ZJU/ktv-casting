@@ -6,8 +6,27 @@ use log::{info, debug, warn};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, /*AtomicU32,*/ Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+
+// ── 超时常量 ──────────────────────────────────────────────
+// 所有可能阻塞 App 主线程（JNI block_on）或 CLI 键盘事件的
+// 同步等待都必须在此阈值内返回，否则会触发 Android ANR（5s）。
+pub const ANR_DEADLINE: Duration = Duration::from_secs(5);
+
+/// DLNA SOAP 请求超时。局域网内正常响应 <100ms，3s 留有充足余量。
+pub const SOAP_TIMEOUT: Duration = Duration::from_secs(3);
+const _: () = assert!(SOAP_TIMEOUT.as_secs() < ANR_DEADLINE.as_secs(),
+    "SOAP_TIMEOUT 必须小于 ANR_DEADLINE (5s)，否则设备不响应时无法在 ANR 前返回");
+
+/// B站 API / 点歌台 HTTP 请求超时。
+pub const API_TIMEOUT: Duration = Duration::from_secs(3);
+const _: () = assert!(API_TIMEOUT.as_secs() < ANR_DEADLINE.as_secs(),
+    "API_TIMEOUT 必须小于 ANR_DEADLINE (5s)，否则 B 站 API 不响应时无法在 ANR 前返回");
+
+/// 媒体代理上游连接超时。此路径不在 block_on 链路上，可设得更宽松。
+pub const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(target_os = "android")]
 pub mod android;
@@ -115,7 +134,9 @@ pub fn trigger_next_song() {
             let ctx_task = Arc::clone(ctx);
             ctx.rt.spawn(async move {
                 let mut pm = ctx_task.playlist_manager.clone();
-                let _ = pm.next_song().await;
+                if let Err(e) = pm.next_song().await {
+                    log::warn!("切下一首失败: {}", e);
+                }
             });
         }
     }
@@ -126,7 +147,9 @@ pub fn trigger_prev_song() {
             let ctx_task = Arc::clone(ctx);
             ctx.rt.spawn(async move {
                 let mut pm = ctx_task.playlist_manager.clone();
-                let _ = pm.prev_song().await;
+                if let Err(e) = pm.prev_song().await {
+                    log::warn!("切上一首失败: {}", e);
+                }
             });
         }
     }
@@ -243,7 +266,7 @@ pub async fn connect_dlna_device(
             // 媒体代理 client：只限制连接建立阶段，避免上游连接挂起导致设备拉流卡死
             // （流式响应本身不能设整体 timeout，否则长视频会被掐断）
             let proxy_client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(PROXY_CONNECT_TIMEOUT)
                 .build()
                 .expect("创建媒体代理 HTTP 客户端失败");
             App::new()
@@ -288,7 +311,9 @@ pub async fn connect_room(
         let cache = Arc::clone(&cache_cb);
         Box::pin(async move {
             info!("通知设备准备拉取路径: {}", video_url);
-            let _ = c.play_song(&cast::SongRef(video_url.clone())).await;
+            if let Err(e) = c.play_song(&cast::SongRef(video_url.clone())).await {
+                warn!("自动切歌失败: {}", e);
+            }
 
             // 如果是 BV 视频，立刻从 bilibili API 获取时长并写入 cache
             if let Some((bvid,page)) = extract_bvid(&video_url) {

@@ -85,11 +85,15 @@ fn form_body(params: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-fn bili_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(UA)
-        .build()
-        .expect("reqwest client")
+fn bili_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(UA)
+            .timeout(crate::API_TIMEOUT)
+            .build()
+            .expect("reqwest client")
+    })
 }
 
 /// Login via QR code. `on_qr(url)` is called once with the QR URL to display.
@@ -438,7 +442,10 @@ impl Caster for BilibiliCaster {
         let aid = bv_to_aid(&bvid);
         log::debug!("[Bilibili] BV to AID: {} -> {}", bvid, aid);
 
-        let (cid, duration) = get_page_info(&bvid, page).await.unwrap_or((0, 0));
+        let (cid, duration) = get_page_info(&bvid, page).await.map_err(|e| {
+            log::error!("[Bilibili] get_page_info 失败: {}, bvid={}, page={}", e, bvid, page);
+            CastError::Device(e)
+        })?;
         log::info!("[Bilibili] get_page_info: page={} -> cid={}, duration={}", page, cid, duration);
 
         if duration > 0 {
