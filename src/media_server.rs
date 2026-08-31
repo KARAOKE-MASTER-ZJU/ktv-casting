@@ -1,6 +1,6 @@
 // 使用示例
 use crate::SharedState;
-use crate::bilibili_parser::get_bilibili_link;
+use crate::bilibili_parser::get_bilibili_direct_link;
 use crate::mp4_util::get_mp4_duration;
 use actix_web::{HttpRequest, HttpResponse, get, web};
 use futures_util::StreamExt;
@@ -77,17 +77,12 @@ pub async fn proxy_handler(
 
     info!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
 
-    let requested_qn = req.query_string().split('&').find_map(|p| p.strip_prefix("qn=").and_then(|v| v.parse::<u32>().ok())).unwrap_or_else(crate::get_dlna_quality);
-    let media = if is_direct {
-        None
-    } else {
-        Some(get_bilibili_link(bv_id, page, requested_qn).await
-            .map_err(actix_web::error::ErrorInternalServerError)?)
-    };
     let target_url = if is_direct {
         origin_url.clone()
     } else {
-        media.as_ref().unwrap().url.clone()
+        get_bilibili_direct_link(bv_id, page)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?
     };
 
     info!("Proxy resolved target_url={}", target_url);
@@ -152,28 +147,6 @@ pub async fn proxy_handler(
         actix_web::http::Method::HEAD => client.head(&target_url),
         _ => client.get(&target_url),
     };
-
-    // DASH 1080p is video-only on Bilibili.  Let ffmpeg remux the selected
-    // video and audio tracks into one DLNA-friendly fragmented MP4 stream.
-    // The endpoint remains the same; clients only add ?qn=80.  720p durl
-    // continues through the old proxy path unchanged.
-    if let Some(audio_url) = media.as_ref().and_then(|m| m.audio_url.as_ref()) {
-        if req.method() != actix_web::http::Method::HEAD {
-            let mut child = tokio::process::Command::new("ffmpeg")
-                .args(["-hide_banner", "-loglevel", "error", "-i"])
-                .arg(&target_url)
-                .args(["-headers", "Referer: https://www.bilibili.com/\r\nUser-Agent: Mozilla/5.0\r\n", "-i"])
-                .arg(audio_url)
-                .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn().map_err(actix_web::error::ErrorInternalServerError)?;
-            let stdout = child.stdout.take().ok_or_else(|| actix_web::error::ErrorInternalServerError("ffmpeg stdout unavailable"))?;
-            let stream = tokio_util::io::ReaderStream::new(stdout);
-            return Ok(HttpResponse::Ok().insert_header(("Content-Type", "video/mp4"))
-                .insert_header(("Accept-Ranges", "none")).streaming(stream));
-        }
-    }
 
     if target_url.contains("eplus") {
         upstream = upstream

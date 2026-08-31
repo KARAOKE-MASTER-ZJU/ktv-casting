@@ -4,7 +4,7 @@ use crate::playlist_manager::PlaylistManager;
 use actix_web::{App, HttpServer, web};
 use log::{info, debug, warn};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, /*AtomicU32,*/ Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -39,19 +39,6 @@ pub mod mp4_util;
 pub mod playlist_manager;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
-
-/// Quality used by the DLNA media proxy.  64 keeps the historical 720p path;
-/// 80 enables the experimental DASH/remux path.
-pub static DLNA_QUALITY: AtomicU32 = AtomicU32::new(64);
-
-pub fn set_dlna_quality(qn: u32) -> Option<u32> {
-    if matches!(qn, 64 | 80) {
-        DLNA_QUALITY.store(qn, Ordering::Relaxed);
-        Some(qn)
-    } else { None }
-}
-
-pub fn get_dlna_quality() -> u32 { DLNA_QUALITY.load(Ordering::Relaxed) }
 
 /// DLNA 媒体代理服务器的关闭信号。
 static MEDIA_SERVER_SHUTDOWN: RwLock<Option<Arc<Notify>>> = RwLock::new(None);
