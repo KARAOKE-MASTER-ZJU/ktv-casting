@@ -4,7 +4,7 @@ use crate::bilibili_parser::{BilibiliMedia, get_bilibili_media};
 use crate::mp4_util::get_mp4_duration;
 use actix_web::{HttpRequest, HttpResponse, get, web};
 use futures_util::StreamExt;
-use log::info;
+use log::{debug, info};
 
 #[get("/{url:.*}")]
 pub async fn proxy_handler(
@@ -42,7 +42,7 @@ pub async fn proxy_handler(
         }
     }
 
-    info!("Received proxy request for URL: {}", origin_url);
+    debug!("Received proxy request for URL: {}", origin_url);
     let range_hdr = req
         .headers()
         .get(actix_web::http::header::RANGE)
@@ -54,7 +54,7 @@ pub async fn proxy_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("<none>");
 
-    info!(
+    debug!(
         "Proxy request: method={} path={} origin_url={} Range={} If-Range={}",
         req.method(),
         req.path(),
@@ -79,7 +79,7 @@ pub async fn proxy_handler(
         (bv_id, page)
     };
 
-    info!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
+    debug!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
 
     let requested_qn = req
         .query_string()
@@ -95,9 +95,33 @@ pub async fn proxy_handler(
             url: origin_url.clone(),
         }
     } else {
-        get_bilibili_media(bv_id, page, requested_qn)
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?
+        match get_bilibili_media(bv_id, page, requested_qn).await {
+            Ok(media) => media,
+            // Not every public video exposes an anonymous id=80 DASH track. Do not
+            // leave a renderer waiting on a failed 1080p request: preserve the
+            // established 720p single-file route for that title.
+            Err(error) if requested_qn >= 80 => {
+                log::warn!(
+                    target: "DLNA1080",
+                    "1080P 不可用，自动回退 720P: bvid={}, page={:?}, reason={}",
+                    bv_id,
+                    page,
+                    error
+                );
+                get_bilibili_media(bv_id, page, 64)
+                    .await
+                    .map_err(|fallback_error| {
+                        log::error!(
+                            target: "DLNA1080",
+                            "720P 回退也失败: bvid={}, error={}",
+                            bv_id,
+                            fallback_error
+                        );
+                        actix_web::error::ErrorInternalServerError(fallback_error)
+                    })?
+            }
+            Err(error) => return Err(actix_web::error::ErrorInternalServerError(error)),
+        }
     };
 
     if let BilibiliMedia::Dash {
@@ -108,6 +132,13 @@ pub async fn proxy_handler(
     } = media
     {
         info!(target: "DLNA1080", "媒体请求进入 DASH 混流: {}x{}, qn={}, method={}", width, height, requested_qn, req.method());
+        if let Some(range) = req.headers().get(actix_web::http::header::RANGE) {
+            log::warn!(
+                target: "DLNA1080",
+                "DLNA renderer 请求字节 Range，但 fMP4 混流当前不可随机寻址: {:?}",
+                range
+            );
+        }
         if *req.method() == actix_web::http::Method::HEAD {
             info!(target: "DLNA1080", "响应 DLNA HEAD 探测: video/mp4, ranges=none");
             return Ok(HttpResponse::Ok()
@@ -138,7 +169,7 @@ pub async fn proxy_handler(
         unreachable!()
     };
 
-    info!("Proxy resolved target_url={}", target_url);
+    debug!("Proxy resolved target_url={}", target_url);
 
     // 异步获取视频时长并存入缓存（m3u8 直播流跳过，为了避免抓取 HLS 分片时产生大量无用且失败的网络请求，直接地址也需要跳过对 ts/m4s/fmp4 分片或带有结尾查询串切片的探测）
     let is_hls = origin_url

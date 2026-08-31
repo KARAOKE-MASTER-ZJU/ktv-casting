@@ -202,6 +202,8 @@ Rust 的 `DlnaCaster` 只接受这两个值。切换后重新向设备设置相�
 - 每 100 个 fragment 的混流进度、正常完成或下游中断；
 - HTTP HEAD 探测和开始向 DLNA 设备输出的时点。
 
+如果某视频匿名 API 不提供 `id=80` 的 1080P DASH 轨道，DLNA 代理会记录 WARN 并自动回退到原有的 720P 完整 MP4，不会把播放器留在失败的 1080P 请求上。
+
 CDN 地址在写入日志前会删除 query 参数，避免泄露临时 token、deadline 等鉴权信息。
 
 完整网络测试：

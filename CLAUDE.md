@@ -58,3 +58,10 @@ gh run view $LATEST_RUN --repo birchtree2/ktv-casting-android-app --web
 **关键字段说明：**
 - `status`: `queued` (排队中), `in_progress` (运行中), `completed` (已完成)
 - `conclusion`: `success` (成功), `failure` (失败), `neutral` (中立), 空值表示正在运行
+
+## 发布与提交规则
+
+- GitHub Release 必须通过推送 `v*` tag 触发；只推分支用于编译检查，不会创建 Release。
+- Git commit message 必须使用中文，保持简短并准确描述用户可见变化。
+- 版本号严格遵守 Semantic Versioning：兼容新增功能升 minor，兼容修复升 patch，破坏性变更升 major。
+- `+dev.*` 仅表示 fork 开发构建的 SemVer build metadata，不能代替正确的 major/minor/patch 递增。

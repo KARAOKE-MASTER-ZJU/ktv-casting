@@ -215,7 +215,14 @@ async fn send_soap_shared(
         .map_err(rupnp::Error::invalid_response)?;
 
     if status.as_u16() == 200 {
-        log::info!("UPnP Action (shared) succeeded with url: {}", final_url);
+        // GetPositionInfo is polled roughly once per second by the app. A successful
+        // SOAP round-trip is useful only at DEBUG level; INFO must stay available for
+        // playback, muxing and failure diagnostics.
+        log::debug!(
+            "UPnP Action (shared) succeeded: action={}, url={}",
+            action,
+            final_url
+        );
         log::debug!("UPnP Action (shared) status=200 body={}", text);
         Ok(parse_soap_response_fields(&text))
     } else {
