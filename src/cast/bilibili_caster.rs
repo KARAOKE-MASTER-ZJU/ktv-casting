@@ -28,6 +28,15 @@ pub struct BilibiliSession {
     pub mid: u64,
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Cookies returned by the TV QR login (notably SESSDATA/bili_jct).
+    #[serde(default)]
+    pub cookies: Vec<BilibiliCookie>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BilibiliCookie {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +159,12 @@ pub async fn login_qr(on_qr: impl Fn(String) + Send + Sync) -> Result<BilibiliSe
                     .as_u64()
                     .unwrap_or(7776000);
                 let expires_at = Some(now_ts() + expires_in);
-                let session = BilibiliSession { access_token: token, mid, expires_at };
+                let cookies = poll["data"]["cookie_info"]["cookies"]
+                    .as_array().map(|items| items.iter().filter_map(|c| Some(BilibiliCookie {
+                        name: c["name"].as_str()?.to_string(),
+                        value: c["value"].as_str()?.to_string(),
+                    })).collect()).unwrap_or_default();
+                let session = BilibiliSession { access_token: token, mid, expires_at, cookies };
                 save_session(&session)?;
                 return Ok(session);
             }
@@ -256,7 +270,8 @@ pub fn load_session() -> Option<BilibiliSession> {
     if let (Some(t), Some(m)) = (v["access_token"].as_str(), v["mid"].as_u64()) {
         let expires_at = v["expires_at"].as_u64();
         log::info!("[Bilibili] 成功加载 session (UID: {}, expires_at: {:?})", m, expires_at);
-        return Some(BilibiliSession { access_token: t.into(), mid: m, expires_at });
+        let cookies = parse_cookie_list(&v["cookies"]);
+        return Some(BilibiliSession { access_token: t.into(), mid: m, expires_at, cookies });
     }
     // Python format: {"data": {"token_info": {"access_token": "..."}, "mid": 123}}
     if let (Some(t), Some(m)) = (
@@ -264,10 +279,26 @@ pub fn load_session() -> Option<BilibiliSession> {
         v["data"]["mid"].as_u64(),
     ) {
         log::info!("[Bilibili] 成功加载 session (Python 格式, UID: {})", m);
-        return Some(BilibiliSession { access_token: t.into(), mid: m, expires_at: None });
+        let cookies = parse_cookie_info(&v["data"]["cookie_info"]);
+        return Some(BilibiliSession { access_token: t.into(), mid: m, expires_at: None, cookies });
     }
     log::warn!("[Bilibili] Session 格式无法识别");
     None
+}
+
+fn parse_cookie_info(value: &Value) -> Vec<BilibiliCookie> {
+    parse_cookie_list(&value["cookies"])
+}
+
+fn parse_cookie_list(value: &Value) -> Vec<BilibiliCookie> {
+    value.as_array().map(|items| items.iter().filter_map(|c| Some(BilibiliCookie {
+        name: c["name"].as_str()?.to_string(),
+        value: c["value"].as_str()?.to_string(),
+    })).collect()).unwrap_or_default()
+}
+
+pub fn cookie_header(session: &BilibiliSession) -> String {
+    session.cookies.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; ")
 }
 
 pub fn is_session_expired(session: &BilibiliSession) -> bool {

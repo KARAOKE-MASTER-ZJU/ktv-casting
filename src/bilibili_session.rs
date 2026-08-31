@@ -6,8 +6,8 @@
 //! depending on the Bilibili caster implementation details.
 
 pub use crate::cast::bilibili_caster::{
-    BilibiliSession, clear_session, init_session_dir, is_session_expired, load_session,
-    login_qr, save_session,
+    BilibiliCookie, BilibiliSession, clear_session, cookie_header, init_session_dir,
+    is_session_expired, load_session, login_qr, save_session,
 };
 
 /// Whether a valid persisted account session is available.
