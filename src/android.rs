@@ -463,6 +463,26 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getQuality(
     crate::get_quality_core().as_qn() as jint
 }
 
+/// Set the DLNA proxy quality: 64=720p, 80=1080p beta.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_setDlnaQuality(
+    _env: JNIEnv,
+    _class: JClass,
+    qn: jint,
+) -> jint {
+    crate::set_dlna_quality(qn as u32).unwrap_or(0) as jint
+}
+
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getDlnaQuality(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    crate::get_dlna_quality() as jint
+}
+
 // 11. 控制接口：跳转进度 (Seek)
 // 返回 1 表示成功，-1 表示失败
 #[allow(non_snake_case)]

@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::OnceLock;
 
 /// 全局共享 B站 API 客户端：连接池复用 + 超时。
@@ -71,18 +72,34 @@ pub async fn get_page_duration(bv_id: &str, page: u32) -> Result<u32, String> {
 /// # Returns
 /// * `Result<String, String>` - 返回直链URL或错误信息
 pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<String, String> {
+    get_bilibili_link(bv_id, page, 64).await.map(|m| m.url)
+}
+
+/// Resolve a single, backwards-compatible media URL.  720p keeps using durl
+/// when Bilibili provides it; this is the format most DLNA renderers handle.
+/// For 1080p the caller should use `get_bilibili_media`, since Bilibili normally
+/// returns separate DASH video/audio tracks.
+pub async fn get_bilibili_link(bv_id: &str, page: Option<u32>, qn: u32) -> Result<MediaLink, String> {
     let page = page.unwrap_or(0);
 
     //如果bv_id本来就是一个URL，直接返回
     if bv_id.starts_with("http") {
-        return Ok(bv_id.to_string());
+        return Ok(MediaLink { url: bv_id.to_string(), audio_url: None, height: None, has_audio: true });
     }
 
     // 第一步：获取CID
     let cid = get_video_cid(bv_id, page).await?;
 
     // 第二步：获取视频直链
-    get_video_url(bv_id, &cid).await
+    get_video_url(bv_id, &cid, qn).await
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaLink {
+    pub url: String,
+    pub audio_url: Option<String>,
+    pub height: Option<u32>,
+    pub has_audio: bool,
 }
 
 /// 获取视频的CID（分集ID）
@@ -140,11 +157,26 @@ async fn get_video_cid(bv_id: &str, page: u32) -> Result<String, String> {
 }
 
 /// 获取视频播放链接
-async fn get_video_url(bv_id: &str, cid: &str) -> Result<String, String> {
-    let url = format!(
-        "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=116&type=&otype=json&platform=html5&high_quality=1",
-        bv_id, cid
-    );
+async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<MediaLink, String> {
+    let nav: Value = bili_api_client().get("https://api.bilibili.com/x/web-interface/nav")
+        .send().await.map_err(|e| format!("请求 WBI key 失败: {e}"))?
+        .json().await.map_err(|e| format!("解析 WBI key 失败: {e}"))?;
+    let img = nav["data"]["wbi_img"]["img_url"].as_str().unwrap_or("");
+    let sub = nav["data"]["wbi_img"]["sub_url"].as_str().unwrap_or("");
+    let a = img.rsplit('/').next().unwrap_or("").split('.').next().unwrap_or("");
+    let b = sub.rsplit('/').next().unwrap_or("").split('.').next().unwrap_or("");
+    let raw = format!("{a}{b}");
+    const MIX: [usize; 64] = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52];
+    let key: String = MIX.iter().filter_map(|&i| raw.chars().nth(i)).take(32).collect(); 
+    let wts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs();
+    // Keep the established single-file path for 720p.  Higher qualities use
+    // DASH so the caller can select the actual returned 1080p track.
+    let fnval = if qn <= 64 { "0" } else { "4048" };
+    let mut params = vec![("bvid", bv_id.to_string()), ("cid", cid.to_string()), ("fnval", fnval.into()), ("qn", qn.to_string()), ("wts", wts.to_string())];
+    params.sort_by(|x,y| x.0.cmp(y.0));
+    let query = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(params.iter().map(|(k,v)| (*k, v))).finish();
+    let wrid = format!("{:x}", md5::compute(format!("{query}{key}")));
+    let url = format!("https://api.bilibili.com/x/player/wbi/playurl?{query}&w_rid={wrid}");
 
     let response = bili_api_client()
         .get(&url)
@@ -167,16 +199,15 @@ async fn get_video_url(bv_id: &str, cid: &str) -> Result<String, String> {
         ));
     }
 
-    // 提取直链
-    let video_url = json
-        .get("data")
-        .and_then(|d| d.get("durl"))
-        .and_then(|d| d.get(0))
-        .and_then(|d| d.get("url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| "无法获取视频链接".to_string())?;
-
-    Ok(video_url.to_string())
+    let data = &json["data"];
+    if let Some(u) = data["durl"][0]["url"].as_str() {
+        return Ok(MediaLink { url: u.to_string(), audio_url: None, height: Some(data["quality"].as_u64().unwrap_or(0) as u32), has_audio: true });
+    }
+    let video = data["dash"]["video"].as_array().and_then(|v| v.iter().filter(|x| x["height"].as_u64().unwrap_or(0) <= 1080).max_by_key(|x| x["height"].as_u64().unwrap_or(0)))
+        .ok_or_else(|| "播放接口没有返回可用视频轨道（可能需要登录或被风控）".to_string())?;
+    let audio = data["dash"]["audio"][0]["baseUrl"].as_str().or_else(|| data["dash"]["audio"][0]["base_url"].as_str()).map(str::to_string);
+    let vu = video["baseUrl"].as_str().or_else(|| video["base_url"].as_str()).ok_or("视频轨道没有 URL")?;
+    Ok(MediaLink { url: vu.to_string(), audio_url: audio, height: video["height"].as_u64().map(|x| x as u32), has_audio: false })
 }
 
 #[cfg(test)]
@@ -186,9 +217,13 @@ mod tests {
     #[tokio::test]
     async fn test_get_bilibili_direct_link() {
         // 示例：测试获取视频直链
-        match get_bilibili_direct_link("BV1LS4MzKE8y", Some(2)).await {
+        match get_bilibili_direct_link("BV1p8VQ6DE7Y", Some(0)).await {
             Ok(url) => println!("视频直链: {}", url),
             Err(e) => println!("错误: {}", e),
+        }
+        match get_bilibili_link("BV1p8VQ6DE7Y", Some(0), 80).await {
+            Ok(media) => println!("1080 beta: height={:?}, has_audio={}, audio={}", media.height, media.has_audio, media.audio_url.is_some()),
+            Err(e) => println!("1080 beta 错误: {}", e),
         }
     }
 }
