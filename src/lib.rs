@@ -4,7 +4,7 @@ use crate::playlist_manager::PlaylistManager;
 use actix_web::{App, HttpServer, web};
 use log::{info, debug, warn};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, /*AtomicU32,*/ Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -32,6 +32,8 @@ pub const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub mod android;
 
 pub mod bilibili_parser;
+/// Shared Bilibili authentication/session facade used by both casters.
+pub mod bilibili_session;
 pub mod cast;
 pub mod dlna_controller;
 pub mod media_server;
@@ -39,6 +41,18 @@ pub mod mp4_util;
 pub mod playlist_manager;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
+static DLNA_QUALITY: AtomicU32 = AtomicU32::new(64);
+
+pub fn set_dlna_quality(qn: u32) -> Option<cast::Quality> {
+    let quality = cast::Quality::from_qn(qn)?;
+    if !matches!(quality, cast::Quality::P720 | cast::Quality::P1080) { return None; }
+    DLNA_QUALITY.store(qn, Ordering::Relaxed);
+    Some(quality)
+}
+
+pub fn get_dlna_quality() -> cast::Quality {
+    cast::Quality::from_qn(DLNA_QUALITY.load(Ordering::Relaxed)).unwrap_or(cast::Quality::P720)
+}
 
 /// DLNA 媒体代理服务器的关闭信号。
 static MEDIA_SERVER_SHUTDOWN: RwLock<Option<Arc<Notify>>> = RwLock::new(None);

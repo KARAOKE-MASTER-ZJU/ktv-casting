@@ -1,6 +1,6 @@
 // 使用示例
 use crate::SharedState;
-use crate::bilibili_parser::get_bilibili_direct_link;
+use crate::bilibili_parser::get_bilibili_direct_link_quality;
 use crate::mp4_util::get_mp4_duration;
 use actix_web::{HttpRequest, HttpResponse, get, web};
 use futures_util::StreamExt;
@@ -77,10 +77,15 @@ pub async fn proxy_handler(
 
     info!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
 
+    let requested_qn = req
+        .query_string()
+        .split('&')
+        .find_map(|p| p.strip_prefix("qn=").and_then(|v| v.parse::<u32>().ok()))
+        .unwrap_or_else(|| crate::get_dlna_quality().as_qn());
     let target_url = if is_direct {
         origin_url.clone()
     } else {
-        get_bilibili_direct_link(bv_id, page)
+        get_bilibili_direct_link_quality(bv_id, page, requested_qn)
             .await
             .map_err(actix_web::error::ErrorInternalServerError)?
     };

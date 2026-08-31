@@ -71,6 +71,17 @@ pub async fn get_page_duration(bv_id: &str, page: u32) -> Result<u32, String> {
 /// # Returns
 /// * `Result<String, String>` - 返回直链URL或错误信息
 pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<String, String> {
+    get_bilibili_direct_link_quality(bv_id, page, 64).await
+}
+
+/// Resolve a legacy single-file Bilibili URL.  720p is anonymous; 1080p
+/// requires the persisted TV login access_key and deliberately fails with a
+/// user-actionable message when no valid session exists.
+pub async fn get_bilibili_direct_link_quality(
+    bv_id: &str,
+    page: Option<u32>,
+    qn: u32,
+) -> Result<String, String> {
     let page = page.unwrap_or(0);
 
     //如果bv_id本来就是一个URL，直接返回
@@ -82,7 +93,7 @@ pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<
     let cid = get_video_cid(bv_id, page).await?;
 
     // 第二步：获取视频直链
-    get_video_url(bv_id, &cid).await
+    get_video_url(bv_id, &cid, qn).await
 }
 
 /// 获取视频的CID（分集ID）
@@ -140,11 +151,19 @@ async fn get_video_cid(bv_id: &str, page: u32) -> Result<String, String> {
 }
 
 /// 获取视频播放链接
-async fn get_video_url(bv_id: &str, cid: &str) -> Result<String, String> {
-    let url = format!(
-        "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=116&type=&otype=json&platform=html5&high_quality=1",
-        bv_id, cid
+async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<String, String> {
+    let qn = if qn == 80 { 80 } else { 64 };
+    let mut url = format!(
+        "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&type=&otype=json&platform=html5&high_quality=1",
+        bv_id, cid, qn
     );
+    if qn >= 80 {
+        let session = crate::bilibili_session::load_session()
+            .filter(|s| !crate::bilibili_session::is_session_expired(s))
+            .ok_or_else(|| "1080P 需要先扫码登录 B站".to_string())?;
+        url.push_str("&access_key=");
+        url.push_str(&urlencoding::encode(&session.access_token));
+    }
 
     let response = bili_api_client()
         .get(&url)
@@ -189,6 +208,11 @@ mod tests {
         match get_bilibili_direct_link("BV1LS4MzKE8y", Some(2)).await {
             Ok(url) => println!("视频直链: {}", url),
             Err(e) => println!("错误: {}", e),
+        }
+        crate::bilibili_session::init_session_dir("b-api/biliTVCast");
+        match get_bilibili_direct_link_quality("BV1p8VQ6DE7Y", Some(0), 80).await {
+            Ok(url) => println!("1080P with persisted session: {}", url),
+            Err(e) => println!("1080P with persisted session error: {}", e),
         }
     }
 }
