@@ -33,16 +33,25 @@ struct BoxReader {
 }
 
 impl BoxReader {
-    async fn open(client: &reqwest::Client, url: &str) -> io::Result<Self> {
+    async fn open(client: &reqwest::Client, url: &str, track: &'static str) -> io::Result<Self> {
+        let endpoint = safe_endpoint(url);
+        log::info!(target: "DLNA1080", "连接 {} 上游: {}", track, endpoint);
         let response = client
             .get(url)
             .header("User-Agent", "Mozilla/5.0")
             .header("Referer", "https://www.bilibili.com/")
             .send()
             .await
-            .map_err(io::Error::other)?
+            .map_err(|err| {
+                log::error!(target: "DLNA1080", "连接 {} 上游失败: {}, error={}", track, endpoint, err);
+                io::Error::other(err)
+            })?
             .error_for_status()
-            .map_err(io::Error::other)?;
+            .map_err(|err| {
+                log::error!(target: "DLNA1080", "{} 上游 HTTP 失败: {}, error={}", track, endpoint, err);
+                io::Error::other(err)
+            })?;
+        log::info!(target: "DLNA1080", "{} 上游连接成功: status={}", track, response.status());
         Ok(Self {
             stream: Box::pin(response.bytes_stream()),
             buffered: BytesMut::new(),
@@ -95,8 +104,12 @@ struct TrackSource {
 }
 
 impl TrackSource {
-    async fn open(client: &reqwest::Client, url: &str) -> io::Result<(Bytes, Self)> {
-        let mut reader = BoxReader::open(client, url).await?;
+    async fn open(
+        client: &reqwest::Client,
+        url: &str,
+        track: &'static str,
+    ) -> io::Result<(Bytes, Self)> {
+        let mut reader = BoxReader::open(client, url, track).await?;
         let mut ftyp = None;
         let mut moov = None;
         let mut pending_moof = None;
@@ -120,6 +133,14 @@ impl TrackSource {
 
         let ftyp = ftyp.ok_or_else(|| invalid("fMP4 source has no ftyp"))?;
         let moov = moov.ok_or_else(|| invalid("fMP4 source has no moov"))?;
+        log::info!(
+            target: "DLNA1080",
+            "{} 初始化段读取完成: ftyp={}B, moov={}B, indexed_media={}B",
+            track,
+            ftyp.len(),
+            moov.len(),
+            referenced_bytes.map_or_else(|| "unknown".to_string(), |size| size.to_string())
+        );
         Ok((
             ftyp,
             Self {
@@ -173,9 +194,10 @@ pub async fn mux_dash(
     video_url: &str,
     audio_url: &str,
 ) -> io::Result<MuxedMp4> {
+    log::info!(target: "DLNA1080", "开始纯 Rust 在线 fMP4 混流");
     let ((video_ftyp, mut video), (_audio_ftyp, mut audio)) = tokio::try_join!(
-        TrackSource::open(client, video_url),
-        TrackSource::open(client, audio_url),
+        TrackSource::open(client, video_url, "视频"),
+        TrackSource::open(client, audio_url, "音频"),
     )?;
 
     let video_timescale = track_timescale(&video.moov)?;
@@ -185,10 +207,19 @@ pub async fn mux_dash(
         .referenced_bytes
         .zip(audio.referenced_bytes)
         .map(|(v, a)| init.len() as u64 + v + a);
+    log::info!(
+        target: "DLNA1080",
+        "双轨初始化段合并完成: init={}B, video_timescale={}, audio_timescale={}, content_length={}",
+        init.len(),
+        video_timescale,
+        audio_timescale,
+        content_length.map_or_else(|| "unknown".to_string(), |size| size.to_string())
+    );
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
     tokio::spawn(async move {
         if tx.send(Ok(init)).await.is_err() {
+            log::warn!(target: "DLNA1080", "下游在初始化段发送前已断开");
             return;
         }
         let result = mux_fragments(
@@ -200,6 +231,7 @@ pub async fn mux_dash(
         )
         .await;
         if let Err(err) = result {
+            log::error!(target: "DLNA1080", "在线混流失败: {}", err);
             let _ = tx.send(Err(err)).await;
         }
     });
@@ -223,6 +255,9 @@ async fn mux_fragments(
     let mut next_video = video.next_fragment().await?;
     let mut next_audio = audio.next_fragment().await?;
     let mut sequence = 1u32;
+    let mut video_fragments = 0u64;
+    let mut audio_fragments = 0u64;
+    let mut emitted_bytes = 0u64;
 
     while next_video.is_some() || next_audio.is_some() {
         let take_video = match (&next_video, &next_audio) {
@@ -241,9 +276,35 @@ async fn mux_fragments(
             (next_audio.take().expect("checked"), AUDIO_TRACK_ID)
         };
         fragment.moof = patch_moof(&fragment.moof, track_id, sequence)?;
+        let fragment_bytes = (fragment.moof.len() + fragment.mdat.len()) as u64;
+        emitted_bytes += fragment_bytes;
+        if take_video {
+            video_fragments += 1;
+        } else {
+            audio_fragments += 1;
+        }
         sequence = sequence.wrapping_add(1);
         if tx.send(Ok(fragment.moof)).await.is_err() || tx.send(Ok(fragment.mdat)).await.is_err() {
+            log::warn!(
+                target: "DLNA1080",
+                "DLNA 下游中途断开: video_fragments={}, audio_fragments={}, emitted={}B",
+                video_fragments,
+                audio_fragments,
+                emitted_bytes
+            );
             return Ok(());
+        }
+
+        let total_fragments = video_fragments + audio_fragments;
+        if total_fragments % 100 == 0 {
+            log::info!(
+                target: "DLNA1080",
+                "混流进度: fragments={} (video={}, audio={}), emitted={}B",
+                total_fragments,
+                video_fragments,
+                audio_fragments,
+                emitted_bytes
+            );
         }
 
         if take_video {
@@ -252,7 +313,27 @@ async fn mux_fragments(
             next_audio = audio.next_fragment().await?;
         }
     }
+    log::info!(
+        target: "DLNA1080",
+        "在线混流完成: video_fragments={}, audio_fragments={}, emitted={}B",
+        video_fragments,
+        audio_fragments,
+        emitted_bytes
+    );
     Ok(())
+}
+
+fn safe_endpoint(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|url| {
+            format!(
+                "{}://{}{}",
+                url.scheme(),
+                url.host_str().unwrap_or("unknown"),
+                url.path()
+            )
+        })
+        .unwrap_or_else(|_| "<invalid-url>".to_string())
 }
 
 fn merge_initialization(
@@ -497,6 +578,14 @@ mod tests {
         let tfhd = child_range(&patched, traf, b"tfhd").unwrap();
         assert_eq!(read_u32(&patched, mfhd.start + 12).unwrap(), 7);
         assert_eq!(read_u32(&patched, tfhd.start + 12).unwrap(), 2);
+    }
+
+    #[test]
+    fn log_endpoint_does_not_expose_query_credentials() {
+        let endpoint =
+            safe_endpoint("https://upos-sz.example.com/path/video.m4s?deadline=123&token=secret");
+        assert_eq!(endpoint, "https://upos-sz.example.com/path/video.m4s");
+        assert!(!endpoint.contains("secret"));
     }
 
     /// Full network fixture used manually before releases. The output stays in

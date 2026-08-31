@@ -180,6 +180,14 @@ async fn get_video_cid(bv_id: &str, page: u32) -> Result<String, String> {
 /// 获取视频播放链接
 async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<BilibiliMedia, String> {
     let wants_1080 = qn >= 80;
+    log::info!(
+        target: "DLNA1080",
+        "请求 Bilibili 播放地址: bvid={}, cid={}, qn={}, mode={}",
+        bv_id,
+        cid,
+        qn,
+        if wants_1080 { "DASH" } else { "完整MP4" }
+    );
     let url = if wants_1080 {
         format!(
             "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=80&fnval=4048&fnver=0&fourk=0&try_look=1",
@@ -206,12 +214,14 @@ async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<BilibiliMedia,
 
     // 检查API返回状态
     if json["code"].as_i64() != Some(0) {
-        return Err(format!(
+        let error = format!(
             "API错误: {}",
             json.get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("未知错误")
-        ));
+        );
+        log::error!(target: "DLNA1080", "播放地址 API 失败: bvid={}, {}", bv_id, error);
+        return Err(error);
     }
 
     let data = &json["data"];
@@ -219,6 +229,7 @@ async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<BilibiliMedia,
         let video_url = data["durl"][0]["url"]
             .as_str()
             .ok_or_else(|| "无法获取 720P 视频链接".to_string())?;
+        log::info!(target: "DLNA1080", "选中 720P 完整 MP4: bvid={}, cid={}", bv_id, cid);
         return Ok(BilibiliMedia::Direct {
             url: video_url.to_string(),
         });
@@ -247,6 +258,20 @@ async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<BilibiliMedia,
         .iter()
         .max_by_key(|a| a["bandwidth"].as_u64().unwrap_or(0))
         .ok_or_else(|| "1080P DASH 音频轨为空".to_string())?;
+
+    log::info!(
+        target: "DLNA1080",
+        "选中 DASH 轨道: bvid={}, video_id={}, codec={}, {}x{}, video_bw={}, audio_id={}, audio_codec={}, audio_bw={}",
+        bv_id,
+        video["id"].as_u64().unwrap_or(0),
+        video["codecs"].as_str().unwrap_or("unknown"),
+        video["width"].as_u64().unwrap_or(0),
+        video["height"].as_u64().unwrap_or(0),
+        video["bandwidth"].as_u64().unwrap_or(0),
+        audio["id"].as_u64().unwrap_or(0),
+        audio["codecs"].as_str().unwrap_or("unknown"),
+        audio["bandwidth"].as_u64().unwrap_or(0),
+    );
 
     let media_url = |value: &Value| {
         value["base_url"]

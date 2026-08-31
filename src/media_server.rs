@@ -107,8 +107,9 @@ pub async fn proxy_handler(
         height,
     } = media
     {
-        info!("Rust fMP4 mux: {}x{}, qn={}", width, height, requested_qn);
+        info!(target: "DLNA1080", "媒体请求进入 DASH 混流: {}x{}, qn={}, method={}", width, height, requested_qn, req.method());
         if *req.method() == actix_web::http::Method::HEAD {
+            info!(target: "DLNA1080", "响应 DLNA HEAD 探测: video/mp4, ranges=none");
             return Ok(HttpResponse::Ok()
                 .insert_header(("Content-Type", "video/mp4"))
                 .insert_header(("Accept-Ranges", "none"))
@@ -117,7 +118,10 @@ pub async fn proxy_handler(
         }
         let muxed = crate::fmp4_mux::mux_dash(client.get_ref(), &video_url, &audio_url)
             .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
+            .map_err(|error| {
+                log::error!(target: "DLNA1080", "创建混流响应失败: {}", error);
+                actix_web::error::ErrorInternalServerError(error)
+            })?;
         let mut response = HttpResponse::Ok();
         response.insert_header(("Content-Type", "video/mp4"));
         response.insert_header(("Accept-Ranges", "none"));
@@ -126,6 +130,7 @@ pub async fn proxy_handler(
         if let Some(content_length) = muxed.content_length {
             response.insert_header(("Content-Length", content_length.to_string()));
         }
+        info!(target: "DLNA1080", "开始向 DLNA 设备输出混流 MP4: content_length={}", muxed.content_length.map_or_else(|| "unknown".to_string(), |size| size.to_string()));
         return Ok(response.streaming(muxed.stream));
     }
 

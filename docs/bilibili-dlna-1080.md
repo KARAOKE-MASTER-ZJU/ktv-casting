@@ -190,6 +190,20 @@ Rust 的 `DlnaCaster` 只接受这两个值。切换后重新向设备设置相�
 
 ## 验证方法
 
+### App 调试日志
+
+1080P 链路的关键日志统一使用 `DLNA1080` tag，并通过 JNI
+`RustEngine.onRustLog()` 写入 App 的 `LogRepository`，可在 App 日志页面查看。覆盖：
+
+- 清晰度切换和媒体重载；
+- 播放地址请求、API 错误及最终 DASH 编码轨选择；
+- 视频/音频上游连接及 HTTP 错误；
+- 初始化段大小、timescale 和预计 `Content-Length`；
+- 每 100 个 fragment 的混流进度、正常完成或下游中断；
+- HTTP HEAD 探测和开始向 DLNA 设备输出的时点。
+
+CDN 地址在写入日志前会删除 query 参数，避免泄露临时 token、deadline 等鉴权信息。
+
 完整网络测试：
 
 ```bash
