@@ -4,7 +4,7 @@ use crate::playlist_manager::PlaylistManager;
 use actix_web::{App, HttpServer, web};
 use log::{info, debug, warn};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, /*AtomicU32,*/ Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -34,11 +34,30 @@ pub mod android;
 pub mod bilibili_parser;
 pub mod cast;
 pub mod dlna_controller;
+pub mod fmp4_mux;
 pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
+
+/// DLNA 媒体代理清晰度。720P 保持旧的完整 MP4 路径，1080P 启用 Rust fMP4 混流。
+static DLNA_QUALITY_QN: AtomicU32 = AtomicU32::new(64);
+
+pub fn set_dlna_quality(quality: cast::Quality) -> Result<(), &'static str> {
+    match quality {
+        cast::Quality::P720 | cast::Quality::P1080 => {
+            DLNA_QUALITY_QN.store(quality.as_qn(), Ordering::Relaxed);
+            Ok(())
+        }
+        _ => Err("DLNA 仅支持 720P 和 1080P(beta)"),
+    }
+}
+
+pub fn get_dlna_quality() -> cast::Quality {
+    cast::Quality::from_qn(DLNA_QUALITY_QN.load(Ordering::Relaxed))
+        .unwrap_or(cast::Quality::P720)
+}
 
 /// DLNA 媒体代理服务器的关闭信号。
 static MEDIA_SERVER_SHUTDOWN: RwLock<Option<Arc<Notify>>> = RwLock::new(None);

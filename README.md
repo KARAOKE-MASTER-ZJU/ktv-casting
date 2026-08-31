@@ -4,6 +4,8 @@
 
 > **配套 Android App**：[ktv-casting-android-app](https://github.com/KARAOKE-MASTER-ZJU/ktv-casting-android-app)
 
+> **技术文档**：[Bilibili DLNA 1080P 与纯 Rust 在线混流](docs/bilibili-dlna-1080.md)
+
 ---
 
 ## 功能概览

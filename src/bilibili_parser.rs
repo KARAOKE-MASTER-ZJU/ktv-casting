@@ -31,7 +31,10 @@ pub fn bv_to_aid(bvid: &str) -> u64 {
     let chars: Vec<char> = s.chars().collect();
     let mut tmp: u64 = 0;
     for i in 0..9 {
-        let idx = alpha.iter().position(|&a| a == chars[BV_DECODE_MAP[i]]).unwrap_or(0) as u64;
+        let idx = alpha
+            .iter()
+            .position(|&a| a == chars[BV_DECODE_MAP[i]])
+            .unwrap_or(0) as u64;
         tmp = tmp * BV_BASE + idx;
     }
     (tmp & BV_MASK_CODE) ^ BV_XOR_CODE
@@ -54,7 +57,10 @@ pub async fn get_page_info(bv_id: &str, page: u32) -> Result<(u64, u32), String>
         return Err(format!("page {} out of range (len={})", page, data.len()));
     }
     let cid = data[idx]["cid"].as_u64().ok_or("no cid")?;
-    let duration = data[idx]["duration"].as_u64().map(|d| d as u32).unwrap_or(0);
+    let duration = data[idx]["duration"]
+        .as_u64()
+        .map(|d| d as u32)
+        .unwrap_or(0);
     Ok((cid, duration))
 }
 
@@ -71,18 +77,50 @@ pub async fn get_page_duration(bv_id: &str, page: u32) -> Result<u32, String> {
 /// # Returns
 /// * `Result<String, String>` - 返回直链URL或错误信息
 pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<String, String> {
+    match get_bilibili_media(bv_id, page, 64).await? {
+        BilibiliMedia::Direct { url } => Ok(url),
+        BilibiliMedia::Dash { .. } => Err("720P 接口意外返回 DASH".to_string()),
+    }
+}
+
+/// B站媒体地址。720P 保持单文件 MP4；1080P 使用独立的 DASH 视频、音频轨。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BilibiliMedia {
+    Direct {
+        url: String,
+    },
+    Dash {
+        video_url: String,
+        audio_url: String,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// 获取指定清晰度的 B站媒体。
+///
+/// `qn=80` 使用实测可用的匿名 DASH 接口。`try_look=1` 会在没有 Cookie 时
+/// 返回可试看高画质轨道；DASH 模式下必须检查 `dash.video[].id`，不能依赖
+/// 顶层 `quality` 字段。
+pub async fn get_bilibili_media(
+    bv_id: &str,
+    page: Option<u32>,
+    qn: u32,
+) -> Result<BilibiliMedia, String> {
     let page = page.unwrap_or(0);
 
     //如果bv_id本来就是一个URL，直接返回
     if bv_id.starts_with("http") {
-        return Ok(bv_id.to_string());
+        return Ok(BilibiliMedia::Direct {
+            url: bv_id.to_string(),
+        });
     }
 
     // 第一步：获取CID
     let cid = get_video_cid(bv_id, page).await?;
 
     // 第二步：获取视频直链
-    get_video_url(bv_id, &cid).await
+    get_video_url(bv_id, &cid, qn).await
 }
 
 /// 获取视频的CID（分集ID）
@@ -140,14 +178,23 @@ async fn get_video_cid(bv_id: &str, page: u32) -> Result<String, String> {
 }
 
 /// 获取视频播放链接
-async fn get_video_url(bv_id: &str, cid: &str) -> Result<String, String> {
-    let url = format!(
-        "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=116&type=&otype=json&platform=html5&high_quality=1",
-        bv_id, cid
-    );
+async fn get_video_url(bv_id: &str, cid: &str, qn: u32) -> Result<BilibiliMedia, String> {
+    let wants_1080 = qn >= 80;
+    let url = if wants_1080 {
+        format!(
+            "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=80&fnval=4048&fnver=0&fourk=0&try_look=1",
+            bv_id, cid
+        )
+    } else {
+        format!(
+            "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=64&type=&otype=json&platform=html5&high_quality=1",
+            bv_id, cid
+        )
+    };
 
     let response = bili_api_client()
         .get(&url)
+        .header("Referer", format!("https://www.bilibili.com/video/{bv_id}"))
         .send()
         .await
         .map_err(|e| format!("请求视频链接失败: {}", e))?;
@@ -167,16 +214,52 @@ async fn get_video_url(bv_id: &str, cid: &str) -> Result<String, String> {
         ));
     }
 
-    // 提取直链
-    let video_url = json
-        .get("data")
-        .and_then(|d| d.get("durl"))
-        .and_then(|d| d.get(0))
-        .and_then(|d| d.get("url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| "无法获取视频链接".to_string())?;
+    let data = &json["data"];
+    if !wants_1080 {
+        let video_url = data["durl"][0]["url"]
+            .as_str()
+            .ok_or_else(|| "无法获取 720P 视频链接".to_string())?;
+        return Ok(BilibiliMedia::Direct {
+            url: video_url.to_string(),
+        });
+    }
 
-    Ok(video_url.to_string())
+    let videos = data["dash"]["video"]
+        .as_array()
+        .ok_or_else(|| "1080P 接口没有返回 DASH 视频轨".to_string())?;
+    let audios = data["dash"]["audio"]
+        .as_array()
+        .ok_or_else(|| "1080P 接口没有返回 DASH 音频轨".to_string())?;
+
+    // DLNA 设备对 AVC/H.264 的支持远好于 HEVC/AV1，优先选择 AVC 的 id=80。
+    let video = videos
+        .iter()
+        .filter(|v| v["id"].as_u64() == Some(80))
+        .max_by_key(|v| {
+            let avc_bonus = v["codecs"].as_str().is_some_and(|c| c.starts_with("avc1")) as u64;
+            avc_bonus * u64::MAX / 2 + v["bandwidth"].as_u64().unwrap_or(0)
+        })
+        .ok_or_else(|| {
+            let ids: Vec<u64> = videos.iter().filter_map(|v| v["id"].as_u64()).collect();
+            format!("B站未返回 1080P DASH 轨道，可用 id={ids:?}")
+        })?;
+    let audio = audios
+        .iter()
+        .max_by_key(|a| a["bandwidth"].as_u64().unwrap_or(0))
+        .ok_or_else(|| "1080P DASH 音频轨为空".to_string())?;
+
+    let media_url = |value: &Value| {
+        value["base_url"]
+            .as_str()
+            .or_else(|| value["baseUrl"].as_str())
+            .map(str::to_string)
+    };
+    Ok(BilibiliMedia::Dash {
+        video_url: media_url(video).ok_or_else(|| "DASH 视频轨没有 URL".to_string())?,
+        audio_url: media_url(audio).ok_or_else(|| "DASH 音频轨没有 URL".to_string())?,
+        width: video["width"].as_u64().unwrap_or(0) as u32,
+        height: video["height"].as_u64().unwrap_or(0) as u32,
+    })
 }
 
 #[cfg(test)]
@@ -189,6 +272,27 @@ mod tests {
         match get_bilibili_direct_link("BV1LS4MzKE8y", Some(2)).await {
             Ok(url) => println!("视频直链: {}", url),
             Err(e) => println!("错误: {}", e),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "public Bilibili network fixture; run manually before release"]
+    async fn test_anonymous_1080_dash() {
+        let media = get_bilibili_media("BV1dqj16aECG", Some(0), 80)
+            .await
+            .expect("目标视频应提供匿名 1080P DASH");
+        match media {
+            BilibiliMedia::Dash {
+                width,
+                height,
+                video_url,
+                audio_url,
+            } => {
+                assert_eq!((width, height), (1920, 1080));
+                assert!(video_url.starts_with("https://"));
+                assert!(audio_url.starts_with("https://"));
+            }
+            BilibiliMedia::Direct { .. } => panic!("1080P 不应退回单文件 720P"),
         }
     }
 }

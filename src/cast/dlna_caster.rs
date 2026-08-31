@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use std::net::IpAddr;
 
+use super::{Capabilities, CastError, Caster, Progress, Quality, SongRef};
 use crate::dlna_controller::{DlnaController, DlnaDevice};
-use super::{Capabilities, CastError, Caster, Progress, SongRef};
 
 pub struct DlnaCaster {
     controller: DlnaController,
     device: DlnaDevice,
     server_ip: IpAddr,
     server_port: u16,
+    current_song: std::sync::Mutex<Option<String>>,
 }
 
 impl DlnaCaster {
@@ -18,7 +19,13 @@ impl DlnaCaster {
         server_ip: IpAddr,
         server_port: u16,
     ) -> Self {
-        Self { controller, device, server_ip, server_port }
+        Self {
+            controller,
+            device,
+            server_ip,
+            server_port,
+            current_song: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -29,6 +36,9 @@ fn e(err: rupnp::Error) -> CastError {
 #[async_trait]
 impl Caster for DlnaCaster {
     async fn play_song(&self, song: &SongRef) -> Result<(), CastError> {
+        if let Ok(mut current) = self.current_song.lock() {
+            *current = Some(song.0.clone());
+        }
         let _ = self.controller.stop(&self.device).await;
         self.controller
             .set_avtransport_uri(&self.device, &song.0, "", self.server_ip, self.server_port)
@@ -57,7 +67,10 @@ impl Caster for DlnaCaster {
         self.controller
             .get_secs(&self.device)
             .await
-            .map(|(curr, total)| Progress { current_secs: curr, total_secs: total })
+            .map(|(curr, total)| Progress {
+                current_secs: curr,
+                total_secs: total,
+            })
             .map_err(e)
     }
 
@@ -69,7 +82,47 @@ impl Caster for DlnaCaster {
     }
 
     async fn get_volume(&self) -> Result<Option<u32>, CastError> {
-        self.controller.get_volume(&self.device).await.map(Some).map_err(e)
+        self.controller
+            .get_volume(&self.device)
+            .await
+            .map(Some)
+            .map_err(e)
+    }
+
+    async fn set_quality(&self, quality: Quality) -> Result<(), CastError> {
+        crate::set_dlna_quality(quality)
+            .map_err(|message| CastError::Device(message.to_string()))?;
+
+        // Re-open the same proxy URL so the renderer immediately requests the
+        // newly selected representation. Keep the old position when possible.
+        let song = self
+            .current_song
+            .lock()
+            .ok()
+            .and_then(|current| current.clone());
+        if let Some(song) = song {
+            let position = self
+                .controller
+                .get_secs(&self.device)
+                .await
+                .ok()
+                .map(|progress| progress.0)
+                .unwrap_or(0);
+            let _ = self.controller.stop(&self.device).await;
+            self.controller
+                .set_avtransport_uri(&self.device, &song, "", self.server_ip, self.server_port)
+                .await
+                .map_err(e)?;
+            self.controller.play(&self.device).await.map_err(e)?;
+            if position > 0 {
+                let _ = self.controller.seek(&self.device, position).await;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_quality(&self) -> Result<Quality, CastError> {
+        Ok(crate::get_dlna_quality())
     }
 
     fn capabilities(&self) -> Capabilities {

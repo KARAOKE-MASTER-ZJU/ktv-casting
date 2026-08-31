@@ -428,7 +428,7 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_getDanmakuState(
     jboolean::from(crate::get_danmaku_core())
 }
 
-// 10d. 控制接口：清晰度（仅B站投屏支持，DLNA 会返回 -1）
+// 10d. 控制接口：清晰度（B站支持全部档位，DLNA 支持 720/1080 beta）
 // qn 跨 JNI 边界仍传裸 int（B站协议常量：16/32/64/80/116），Rust 内部转换成
 // Quality enum 做合法性校验，拒绝非法档位。
 // 返回设置后的 qn，失败（含非法 qn）返回 -1

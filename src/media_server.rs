@@ -1,6 +1,6 @@
 // 使用示例
 use crate::SharedState;
-use crate::bilibili_parser::get_bilibili_direct_link;
+use crate::bilibili_parser::{BilibiliMedia, get_bilibili_media};
 use crate::mp4_util::get_mp4_duration;
 use actix_web::{HttpRequest, HttpResponse, get, web};
 use futures_util::StreamExt;
@@ -19,7 +19,7 @@ pub async fn proxy_handler(
         origin_url.push('?');
         origin_url.push_str(query_string);
     }
-    
+
     // 针对 eplus 的特殊鉴权参数保存与补全逻辑
     if origin_url.contains("eplus") {
         let mut session = shared_state.eplus_auth.lock().await;
@@ -29,7 +29,9 @@ pub async fn proxy_handler(
                 *session = Some(origin_url[query_start + 1..].to_string());
                 info!("Eplus: Saved auth parameters from playlist request");
             }
-        } else if (origin_url.ends_with(".ts") || origin_url.contains(".ts?")) && !origin_url.contains("Signature=") {
+        } else if (origin_url.ends_with(".ts") || origin_url.contains(".ts?"))
+            && !origin_url.contains("Signature=")
+        {
             // 如果是切片请求（.ts）且缺少鉴权，将保存的参数拼接到切片 URL 后
             if let Some(ref auth_params) = *session {
                 let connector = if origin_url.contains('?') { "&" } else { "?" };
@@ -66,7 +68,9 @@ pub async fn proxy_handler(
         (origin_url.as_str(), None)
     } else {
         let path_without_query = origin_url.split('?').next().unwrap_or(origin_url.as_str());
-        let bv_id = &path_without_query[..path_without_query.find('-').unwrap_or(path_without_query.len())];
+        let bv_id = &path_without_query[..path_without_query
+            .find('-')
+            .unwrap_or(path_without_query.len())];
         let page: Option<u32> = if let Some(pos) = path_without_query.find("-page") {
             path_without_query[pos + 5..].parse().ok()
         } else {
@@ -77,12 +81,56 @@ pub async fn proxy_handler(
 
     info!("Proxy parsed: bv_id={} page={:?}", bv_id, page);
 
-    let target_url = if is_direct {
-        origin_url.clone()
+    let requested_qn = req
+        .query_string()
+        .split('&')
+        .find_map(|part| {
+            part.strip_prefix("qn=")
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .unwrap_or_else(|| crate::get_dlna_quality().as_qn());
+
+    let media = if is_direct {
+        BilibiliMedia::Direct {
+            url: origin_url.clone(),
+        }
     } else {
-        get_bilibili_direct_link(bv_id, page)
+        get_bilibili_media(bv_id, page, requested_qn)
             .await
             .map_err(actix_web::error::ErrorInternalServerError)?
+    };
+
+    if let BilibiliMedia::Dash {
+        video_url,
+        audio_url,
+        width,
+        height,
+    } = media
+    {
+        info!("Rust fMP4 mux: {}x{}, qn={}", width, height, requested_qn);
+        if *req.method() == actix_web::http::Method::HEAD {
+            return Ok(HttpResponse::Ok()
+                .insert_header(("Content-Type", "video/mp4"))
+                .insert_header(("Accept-Ranges", "none"))
+                .insert_header(("transferMode.dlna.org", "Streaming"))
+                .finish());
+        }
+        let muxed = crate::fmp4_mux::mux_dash(client.get_ref(), &video_url, &audio_url)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let mut response = HttpResponse::Ok();
+        response.insert_header(("Content-Type", "video/mp4"));
+        response.insert_header(("Accept-Ranges", "none"));
+        response.insert_header(("transferMode.dlna.org", "Streaming"));
+        response.insert_header(("contentFeatures.dlna.org", "DLNA.ORG_OP=00;DLNA.ORG_CI=0"));
+        if let Some(content_length) = muxed.content_length {
+            response.insert_header(("Content-Length", content_length.to_string()));
+        }
+        return Ok(response.streaming(muxed.stream));
+    }
+
+    let BilibiliMedia::Direct { url: target_url } = media else {
+        unreachable!()
     };
 
     info!("Proxy resolved target_url={}", target_url);
@@ -98,11 +146,13 @@ pub async fn proxy_handler(
             .is_some_and(|url| url.ends_with(".m3u8"));
 
     // 对于 HLS 或者是显然属于 FMP4 / HLS segment 的分片文件，避免去请求其时长
-    let is_segment = origin_url.contains("fmp4") 
-        || origin_url.contains(".m4s") 
+    let is_segment = origin_url.contains("fmp4")
+        || origin_url.contains(".m4s")
         || origin_url.contains(".ts")
-        || (is_direct && req.headers().contains_key(actix_web::http::header::RANGE) && !range_hdr.starts_with("bytes=0-"));
-        
+        || (is_direct
+            && req.headers().contains_key(actix_web::http::header::RANGE)
+            && !range_hdr.starts_with("bytes=0-"));
+
     if !is_hls && !is_segment {
         let duration_cache = shared_state.duration_cache.clone();
         let origin_url_clone = origin_url.clone();
@@ -168,7 +218,6 @@ pub async fn proxy_handler(
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36")
             .header("Referer", "https://www.bilibili.com/");
     }
-        
 
     // Forward Range-related headers to support seek/probe.
     if let Some(range) = req.headers().get(actix_web::http::header::RANGE) {
