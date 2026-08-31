@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::net::IpAddr;
 
 use crate::dlna_controller::{DlnaController, DlnaDevice};
-use super::{Capabilities, CastError, Caster, Progress, Quality, SongRef};
+use super::{Capabilities, CastError, Caster, Progress, SongRef};
 
 pub struct DlnaCaster {
     controller: DlnaController,
@@ -70,18 +70,6 @@ impl Caster for DlnaCaster {
 
     async fn get_volume(&self) -> Result<Option<u32>, CastError> {
         self.controller.get_volume(&self.device).await.map(Some).map_err(e)
-    }
-
-    async fn set_quality(&self, quality: Quality) -> Result<(), CastError> {
-        if quality == Quality::P1080 && !crate::bilibili_session::has_valid_session() {
-            return Err(CastError::Device("1080P 需要先扫码登录 B站".into()));
-        }
-        crate::set_dlna_quality(quality.as_qn()).ok_or(CastError::Unsupported)?;
-        Ok(())
-    }
-
-    fn get_quality(&self) -> Result<Quality, CastError> {
-        Ok(crate::get_dlna_quality())
     }
 
     fn capabilities(&self) -> Capabilities {
