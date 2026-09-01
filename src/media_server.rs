@@ -89,6 +89,14 @@ pub async fn proxy_handler(
                 .and_then(|value| value.parse::<u32>().ok())
         })
         .unwrap_or_else(|| crate::get_dlna_quality().as_qn());
+    let start_secs = req
+        .query_string()
+        .split('&')
+        .find_map(|part| {
+            part.strip_prefix("start=")
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .unwrap_or(0);
 
     let media = if is_direct {
         BilibiliMedia::Direct {
@@ -131,11 +139,11 @@ pub async fn proxy_handler(
         height,
     } = media
     {
-        info!(target: "DLNA1080", "媒体请求进入 DASH 混流: {}x{}, qn={}, method={}", width, height, requested_qn, req.method());
+        info!(target: "DLNA1080", "媒体请求进入 DASH 混流: {}x{}, qn={}, start={}s, method={}", width, height, requested_qn, start_secs, req.method());
         if let Some(range) = req.headers().get(actix_web::http::header::RANGE) {
-            log::warn!(
+            log::info!(
                 target: "DLNA1080",
-                "DLNA renderer 请求字节 Range，但 fMP4 混流当前不可随机寻址: {:?}",
+                "DLNA renderer 请求字节 Range；1080P 定位通过重开 start 流处理: {:?}",
                 range
             );
         }
@@ -147,7 +155,12 @@ pub async fn proxy_handler(
                 .insert_header(("transferMode.dlna.org", "Streaming"))
                 .finish());
         }
-        let muxed = crate::fmp4_mux::mux_dash(client.get_ref(), &video_url, &audio_url)
+        let muxed = crate::fmp4_mux::mux_dash_from(
+            client.get_ref(),
+            &video_url,
+            &audio_url,
+            start_secs,
+        )
             .await
             .map_err(|error| {
                 log::error!(target: "DLNA1080", "创建混流响应失败: {}", error);

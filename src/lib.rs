@@ -198,6 +198,11 @@ pub async fn start_engine_core(
         }
     }
 
+    // 每次进入 DLNA 会话都从已验证最稳定的 720P 开始。静态清晰度状态会
+    // 跨引擎重建存活，若不显式重置会让上一会话的 1080P 误成为默认值。
+    set_dlna_quality(cast::Quality::P720).expect("720P is a supported DLNA quality");
+    info!(target: "DLNA1080", "DLNA 新会话默认清晰度: 720P");
+
     let handle = rt.handle().clone();
     let (controller, device, local_ip_addr, port, cache, _) =
         connect_dlna_device(loc_str, handle).await?;

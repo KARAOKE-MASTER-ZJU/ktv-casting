@@ -201,7 +201,21 @@ pub async fn mux_dash(
     video_url: &str,
     audio_url: &str,
 ) -> io::Result<MuxedMp4> {
-    log::info!(target: "DLNA1080", "开始纯 Rust 在线 fMP4 混流");
+    mux_dash_from(client, video_url, audio_url, 0).await
+}
+
+/// Start an online mux at the closest subsequent fMP4 fragment boundary.
+///
+/// DLNA renderers commonly seek with a byte `Range`, which cannot address an
+/// interleaved stream we produce on the fly. Reopening a URL with `start` lets
+/// the caster seek by media time instead, while keeping all muxing in Rust.
+pub async fn mux_dash_from(
+    client: &reqwest::Client,
+    video_url: &str,
+    audio_url: &str,
+    start_secs: u32,
+) -> io::Result<MuxedMp4> {
+    log::info!(target: "DLNA1080", "开始纯 Rust 在线 fMP4 混流: start={}s", start_secs);
     let ((video_ftyp, mut video), (_audio_ftyp, mut audio)) = tokio::try_join!(
         TrackSource::open(client, video_url, "视频"),
         TrackSource::open(client, audio_url, "音频"),
@@ -216,10 +230,14 @@ pub async fn mux_dash(
         video.sidx,
         audio.sidx,
     )?;
-    let content_length = video
-        .sidx
-        .zip(audio.sidx)
-        .map(|(v, a)| init.len() as u64 + v.referenced_bytes + a.referenced_bytes);
+    let content_length = if start_secs == 0 {
+        video
+            .sidx
+            .zip(audio.sidx)
+            .map(|(v, a)| init.len() as u64 + v.referenced_bytes + a.referenced_bytes)
+    } else {
+        None
+    };
     log::info!(
         target: "DLNA1080",
         "双轨初始化段合并完成: init={}B, video_timescale={}, audio_timescale={}, content_length={}",
@@ -241,6 +259,7 @@ pub async fn mux_dash(
             &mut audio,
             video_timescale,
             audio_timescale,
+            start_secs,
         )
         .await;
         if let Err(err) = result {
@@ -264,6 +283,7 @@ async fn mux_fragments(
     audio: &mut TrackSource,
     video_timescale: u32,
     audio_timescale: u32,
+    start_secs: u32,
 ) -> io::Result<()> {
     let mut next_video = video.next_fragment().await?;
     let mut next_audio = audio.next_fragment().await?;
@@ -271,6 +291,9 @@ async fn mux_fragments(
     let mut video_fragments = 0u64;
     let mut audio_fragments = 0u64;
     let mut emitted_bytes = 0u64;
+    let mut skipped_video = 0u64;
+    let mut skipped_audio = 0u64;
+    let mut logged_seek_start = start_secs == 0;
 
     while next_video.is_some() || next_audio.is_some() {
         let take_video = match (&next_video, &next_audio) {
@@ -288,6 +311,31 @@ async fn mux_fragments(
         } else {
             (next_audio.take().expect("checked"), AUDIO_TRACK_ID)
         };
+        let track_timescale = if take_video {
+            video_timescale
+        } else {
+            audio_timescale
+        };
+        if !fragment_is_at_or_after(fragment.decode_time, track_timescale, start_secs) {
+            if take_video {
+                skipped_video += 1;
+                next_video = video.next_fragment().await?;
+            } else {
+                skipped_audio += 1;
+                next_audio = audio.next_fragment().await?;
+            }
+            continue;
+        }
+        if !logged_seek_start {
+            log::info!(
+                target: "DLNA1080",
+                "1080P 定位流开始输出: requested={}s, skipped_video={}, skipped_audio={}",
+                start_secs,
+                skipped_video,
+                skipped_audio
+            );
+            logged_seek_start = true;
+        }
         fragment.moof = patch_moof(&fragment.moof, track_id, sequence)?;
         let fragment_bytes = (fragment.moof.len() + fragment.mdat.len()) as u64;
         emitted_bytes += fragment_bytes;
@@ -334,6 +382,10 @@ async fn mux_fragments(
         emitted_bytes
     );
     Ok(())
+}
+
+fn fragment_is_at_or_after(decode_time: u64, timescale: u32, start_secs: u32) -> bool {
+    decode_time >= u64::from(start_secs) * u64::from(timescale)
 }
 
 fn safe_endpoint(url: &str) -> String {
@@ -756,6 +808,14 @@ mod tests {
         assert_eq!(parsed.referenced_bytes, 200);
         assert_eq!(parsed.duration, 9_000);
         assert_eq!(parsed.timescale, 1_000);
+    }
+
+    #[test]
+    fn seek_start_is_measured_in_each_track_timescale() {
+        assert!(fragment_is_at_or_after(80_000, 16_000, 5));
+        assert!(!fragment_is_at_or_after(79_999, 16_000, 5));
+        assert!(fragment_is_at_or_after(220_500, 44_100, 5));
+        assert!(!fragment_is_at_or_after(220_499, 44_100, 5));
     }
 
     #[test]
