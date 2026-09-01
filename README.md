@@ -6,6 +6,8 @@
 
 > **技术文档**：[Bilibili DLNA 1080P 与纯 Rust 在线混流](docs/bilibili-dlna-1080.md)
 
+> **测试环境设计**：[投屏自动化与虚拟化测试环境设计](docs/automated-casting-test-environment.md)
+
 ---
 
 ## 功能概览
@@ -92,3 +94,7 @@ cargo ndk -t arm64-v8a build --lib --release
 详细的架构说明、模块介绍、协议详解、抓包调试指南等请参阅：
 
 👉 **[docs/DEVELOPER.md](docs/DEVELOPER.md)**
+
+自动化验证 DLNA、Kodi、Android App 与 Bilibili 小电视模式的分层方案请参阅：
+
+👉 **[docs/automated-casting-test-environment.md](docs/automated-casting-test-environment.md)**
