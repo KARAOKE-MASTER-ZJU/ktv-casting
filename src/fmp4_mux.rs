@@ -34,12 +34,29 @@ struct BoxReader {
 
 impl BoxReader {
     async fn open(client: &reqwest::Client, url: &str, track: &'static str) -> io::Result<Self> {
+        Self::open_at(client, url, track, None).await
+    }
+
+    async fn open_at(
+        client: &reqwest::Client,
+        url: &str,
+        track: &'static str,
+        offset: Option<u64>,
+    ) -> io::Result<Self> {
         let endpoint = safe_endpoint(url);
-        log::info!(target: "DLNA1080", "连接 {} 上游: {}", track, endpoint);
-        let response = client
+        if let Some(offset) = offset {
+            log::info!(target: "DLNA1080", "连接 {} 上游定位流: {}, offset={}B", track, endpoint, offset);
+        } else {
+            log::info!(target: "DLNA1080", "连接 {} 上游: {}", track, endpoint);
+        }
+        let mut request = client
             .get(url)
             .header("User-Agent", "Mozilla/5.0")
-            .header("Referer", "https://www.bilibili.com/")
+            .header("Referer", "https://www.bilibili.com/");
+        if let Some(offset) = offset {
+            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+        }
+        let response = request
             .send()
             .await
             .map_err(|err| {
@@ -51,6 +68,12 @@ impl BoxReader {
                 log::error!(target: "DLNA1080", "{} 上游 HTTP 失败: {}, error={}", track, endpoint, err);
                 io::Error::other(err)
             })?;
+        if offset.is_some() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(invalid(format!(
+                "{track} upstream ignored byte range: status={}",
+                response.status()
+            )));
+        }
         log::info!(target: "DLNA1080", "{} 上游连接成功: status={}", track, response.status());
         Ok(Self {
             stream: Box::pin(response.bytes_stream()),
@@ -101,13 +124,24 @@ struct TrackSource {
     moov: Bytes,
     pending_moof: Option<Bytes>,
     sidx: Option<SidxInfo>,
+    url: String,
+    track: &'static str,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SidxInfo {
     referenced_bytes: u64,
     duration: u64,
     timescale: u32,
+    earliest_presentation_time: u64,
+    first_media_offset: u64,
+    entries: Vec<SidxEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidxEntry {
+    referenced_size: u32,
+    subsegment_duration: u32,
 }
 
 impl TrackSource {
@@ -121,21 +155,30 @@ impl TrackSource {
         let mut moov = None;
         let mut pending_moof = None;
         let mut sidx = None;
+        let mut bytes_before_atom = 0u64;
 
         for _ in 0..32 {
             let Some(atom) = reader.next_box().await? else {
                 break;
             };
+            let atom_len = atom.len() as u64;
             match atom_type(&atom)? {
                 b"ftyp" => ftyp = Some(atom),
                 b"moov" => moov = Some(atom),
-                b"sidx" => sidx = parse_sidx(&atom).ok(),
+                b"sidx" => {
+                    sidx = parse_sidx(&atom).ok().map(|mut index| {
+                        index.first_media_offset =
+                            bytes_before_atom + atom.len() as u64 + index.first_media_offset;
+                        index
+                    });
+                }
                 b"moof" => {
                     pending_moof = Some(atom);
                     break;
                 }
                 _ => {}
             }
+            bytes_before_atom += atom_len;
         }
 
         let ftyp = ftyp.ok_or_else(|| invalid("fMP4 source has no ftyp"))?;
@@ -146,7 +189,7 @@ impl TrackSource {
             track,
             ftyp.len(),
             moov.len(),
-            sidx.map_or_else(|| "unknown".to_string(), |info| info.referenced_bytes.to_string())
+            sidx.as_ref().map_or_else(|| "unknown".to_string(), |info| info.referenced_bytes.to_string())
         );
         Ok((
             ftyp,
@@ -155,8 +198,33 @@ impl TrackSource {
                 moov,
                 pending_moof,
                 sidx,
+                url: url.to_owned(),
+                track,
             },
         ))
+    }
+
+    async fn seek_to(&mut self, client: &reqwest::Client, start_secs: u32) -> io::Result<()> {
+        let Some(sidx) = self.sidx.as_ref() else {
+            return Err(invalid("fMP4 source has no sidx seek index"));
+        };
+        let Some((offset, segment_secs)) = sidx_offset_for_start(sidx, start_secs) else {
+            return Err(invalid(format!(
+                "seek position {start_secs}s is outside sidx index"
+            )));
+        };
+        let reader = BoxReader::open_at(client, &self.url, self.track, Some(offset)).await?;
+        self.reader = reader;
+        self.pending_moof = None;
+        log::info!(
+            target: "DLNA1080",
+            "{} 定位索引命中: requested={}s, segment_start={:.3}s, upstream_offset={}B",
+            self.track,
+            start_secs,
+            segment_secs,
+            offset
+        );
+        Ok(())
     }
 
     async fn next_fragment(&mut self) -> io::Result<Option<Fragment>> {
@@ -227,13 +295,14 @@ pub async fn mux_dash_from(
         &video_ftyp,
         &video.moov,
         &audio.moov,
-        video.sidx,
-        audio.sidx,
+        video.sidx.as_ref(),
+        audio.sidx.as_ref(),
     )?;
     let content_length = if start_secs == 0 {
         video
             .sidx
-            .zip(audio.sidx)
+            .as_ref()
+            .zip(audio.sidx.as_ref())
             .map(|(v, a)| init.len() as u64 + v.referenced_bytes + a.referenced_bytes)
     } else {
         None
@@ -246,6 +315,15 @@ pub async fn mux_dash_from(
         audio_timescale,
         content_length.map_or_else(|| "unknown".to_string(), |size| size.to_string())
     );
+
+    if start_secs > 0 {
+        if let Err(error) = video.seek_to(client, start_secs).await {
+            log::warn!(target: "DLNA1080", "视频无法按索引定位，将顺序跳过片段: {}", error);
+        }
+        if let Err(error) = audio.seek_to(client, start_secs).await {
+            log::warn!(target: "DLNA1080", "音频无法按索引定位，将顺序跳过片段: {}", error);
+        }
+    }
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
     tokio::spawn(async move {
@@ -405,8 +483,8 @@ fn merge_initialization(
     video_ftyp: &Bytes,
     video_moov: &Bytes,
     audio_moov: &Bytes,
-    video_sidx: Option<SidxInfo>,
-    audio_sidx: Option<SidxInfo>,
+    video_sidx: Option<&SidxInfo>,
+    audio_sidx: Option<&SidxInfo>,
 ) -> io::Result<Bytes> {
     let mut mvhd = child(video_moov, b"mvhd")?.to_vec();
     let mut video_trak = child(video_moov, b"trak")?.to_vec();
@@ -512,7 +590,7 @@ fn mvhd_timescale(mvhd: &[u8]) -> io::Result<u32> {
     }
 }
 
-fn patch_trak_duration(trak: &mut [u8], sidx: SidxInfo, movie_timescale: u32) -> io::Result<()> {
+fn patch_trak_duration(trak: &mut [u8], sidx: &SidxInfo, movie_timescale: u32) -> io::Result<()> {
     let tkhd = child_range(trak, 0..trak.len(), b"tkhd")?;
     let mdia = child_range(trak, 0..trak.len(), b"mdia")?;
     let mdhd = child_range(trak, mdia, b"mdhd")?;
@@ -677,26 +755,61 @@ fn parse_sidx(sidx: &[u8]) -> io::Result<SidxInfo> {
         return Err(invalid("zero sidx timescale"));
     }
     let mut offset = header + 4 + 4 + 4;
-    offset += if version == 0 { 8 } else { 16 };
+    let earliest_presentation_time = if version == 0 {
+        read_u32(sidx, offset)? as u64
+    } else {
+        read_u64(sidx, offset)?
+    };
+    offset += if version == 0 { 4 } else { 8 };
+    let first_media_offset = if version == 0 {
+        read_u32(sidx, offset)? as u64
+    } else {
+        read_u64(sidx, offset)?
+    };
+    offset += if version == 0 { 4 } else { 8 };
     offset += 2;
     let count = read_u16(sidx, offset)? as usize;
     offset += 2;
     let mut total = 0u64;
     let mut duration = 0u64;
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let reference = read_u32(sidx, offset)?;
         if reference >> 31 != 0 {
             return Err(invalid("nested sidx reference unsupported"));
         }
-        total += (reference & 0x7fff_ffff) as u64;
-        duration += read_u32(sidx, offset + 4)? as u64;
+        let referenced_size = reference & 0x7fff_ffff;
+        let subsegment_duration = read_u32(sidx, offset + 4)?;
+        total += referenced_size as u64;
+        duration += subsegment_duration as u64;
+        entries.push(SidxEntry {
+            referenced_size,
+            subsegment_duration,
+        });
         offset += 12;
     }
     Ok(SidxInfo {
         referenced_bytes: total,
         duration,
         timescale,
+        earliest_presentation_time,
+        first_media_offset,
+        entries,
     })
+}
+
+fn sidx_offset_for_start(sidx: &SidxInfo, start_secs: u32) -> Option<(u64, f64)> {
+    let target_time = (u128::from(start_secs) * u128::from(sidx.timescale)) as u64;
+    let mut offset = sidx.first_media_offset;
+    let mut segment_time = sidx.earliest_presentation_time;
+    for entry in &sidx.entries {
+        if segment_time >= target_time {
+            return Some((offset, segment_time as f64 / sidx.timescale as f64));
+        }
+        offset += u64::from(entry.referenced_size);
+        segment_time += u64::from(entry.subsegment_duration);
+    }
+    None
 }
 
 fn atom_type(data: &[u8]) -> io::Result<&[u8]> {
@@ -808,6 +921,10 @@ mod tests {
         assert_eq!(parsed.referenced_bytes, 200);
         assert_eq!(parsed.duration, 9_000);
         assert_eq!(parsed.timescale, 1_000);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(sidx_offset_for_start(&parsed, 0), Some((0, 0.0)));
+        assert_eq!(sidx_offset_for_start(&parsed, 5), Some((120, 5.0)));
+        assert_eq!(sidx_offset_for_start(&parsed, 9), None);
     }
 
     #[test]
@@ -883,5 +1000,30 @@ mod tests {
             assert_eq!(written, expected);
         }
         assert!(written > 10 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a public Bilibili 1080P stream and verifies indexed seeking"]
+    async fn live_mux_seeks_with_sidx_range() {
+        let media = crate::bilibili_parser::get_bilibili_media("BV1dqj16aECG", Some(0), 80)
+            .await
+            .unwrap();
+        let crate::bilibili_parser::BilibiliMedia::Dash {
+            video_url,
+            audio_url,
+            ..
+        } = media
+        else {
+            panic!("expected DASH");
+        };
+        let client = reqwest::Client::builder().build().unwrap();
+        let mut stream = mux_dash_from(&client, &video_url, &audio_url, 120)
+            .await
+            .unwrap()
+            .stream;
+        let init = stream.next().await.unwrap().unwrap();
+        assert_eq!(atom_type(&init).unwrap(), b"ftyp");
+        let first_fragment = stream.next().await.unwrap().unwrap();
+        assert_eq!(atom_type(&first_fragment).unwrap(), b"moof");
     }
 }
