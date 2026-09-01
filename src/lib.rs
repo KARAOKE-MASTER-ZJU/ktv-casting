@@ -330,18 +330,20 @@ pub async fn connect_room(
         let cache = Arc::clone(&cache_cb);
         Box::pin(async move {
             info!("通知设备准备拉取路径: {}", video_url);
-            if let Err(e) = c.play_song(&cast::SongRef(video_url.clone())).await {
-                warn!("自动切歌失败: {}", e);
-            }
-
-            // 如果是 BV 视频，立刻从 bilibili API 获取时长并写入 cache
+            // 先写入 BV 的完整时长，再通知 DLNA 设备拉流。DASH/fMP4 的 moov
+            // 可能只给 renderer 暴露首个分片（约 5 秒）的临时时长；若先播放，
+            // Android 的自动切歌逻辑会把该临时时长误认为歌曲已结束。
             if let Some((bvid,page)) = extract_bvid(&video_url) {
                 if let Ok((_, duration)) = crate::bilibili_parser::get_page_info(&bvid, page).await {
                     if duration > 0 {
-                        cache.lock().await.insert(video_url, duration);
-                        debug!("预填充 BV 视频时长到 cache: {},p{} -> {}s", bvid, page+1, duration);
+                        cache.lock().await.insert(video_url.clone(), duration);
+                        info!(target: "DLNA1080", "播放前预填充 BV 视频时长: {},p{} -> {}s", bvid, page+1, duration);
                     }
                 }
+            }
+
+            if let Err(e) = c.play_song(&cast::SongRef(video_url.clone())).await {
+                warn!("自动切歌失败: {}", e);
             }
         })
     });

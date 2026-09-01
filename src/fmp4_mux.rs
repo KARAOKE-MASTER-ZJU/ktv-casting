@@ -100,7 +100,14 @@ struct TrackSource {
     reader: BoxReader,
     moov: Bytes,
     pending_moof: Option<Bytes>,
-    referenced_bytes: Option<u64>,
+    sidx: Option<SidxInfo>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidxInfo {
+    referenced_bytes: u64,
+    duration: u64,
+    timescale: u32,
 }
 
 impl TrackSource {
@@ -113,7 +120,7 @@ impl TrackSource {
         let mut ftyp = None;
         let mut moov = None;
         let mut pending_moof = None;
-        let mut referenced_bytes = None;
+        let mut sidx = None;
 
         for _ in 0..32 {
             let Some(atom) = reader.next_box().await? else {
@@ -122,7 +129,7 @@ impl TrackSource {
             match atom_type(&atom)? {
                 b"ftyp" => ftyp = Some(atom),
                 b"moov" => moov = Some(atom),
-                b"sidx" => referenced_bytes = parse_sidx_referenced_bytes(&atom).ok(),
+                b"sidx" => sidx = parse_sidx(&atom).ok(),
                 b"moof" => {
                     pending_moof = Some(atom);
                     break;
@@ -139,7 +146,7 @@ impl TrackSource {
             track,
             ftyp.len(),
             moov.len(),
-            referenced_bytes.map_or_else(|| "unknown".to_string(), |size| size.to_string())
+            sidx.map_or_else(|| "unknown".to_string(), |info| info.referenced_bytes.to_string())
         );
         Ok((
             ftyp,
@@ -147,7 +154,7 @@ impl TrackSource {
                 reader,
                 moov,
                 pending_moof,
-                referenced_bytes,
+                sidx,
             },
         ))
     }
@@ -202,11 +209,17 @@ pub async fn mux_dash(
 
     let video_timescale = track_timescale(&video.moov)?;
     let audio_timescale = track_timescale(&audio.moov)?;
-    let init = merge_initialization(&video_ftyp, &video.moov, &audio.moov)?;
+    let init = merge_initialization(
+        &video_ftyp,
+        &video.moov,
+        &audio.moov,
+        video.sidx,
+        audio.sidx,
+    )?;
     let content_length = video
-        .referenced_bytes
-        .zip(audio.referenced_bytes)
-        .map(|(v, a)| init.len() as u64 + v + a);
+        .sidx
+        .zip(audio.sidx)
+        .map(|(v, a)| init.len() as u64 + v.referenced_bytes + a.referenced_bytes);
     log::info!(
         target: "DLNA1080",
         "双轨初始化段合并完成: init={}B, video_timescale={}, audio_timescale={}, content_length={}",
@@ -340,6 +353,8 @@ fn merge_initialization(
     video_ftyp: &Bytes,
     video_moov: &Bytes,
     audio_moov: &Bytes,
+    video_sidx: Option<SidxInfo>,
+    audio_sidx: Option<SidxInfo>,
 ) -> io::Result<Bytes> {
     let mut mvhd = child(video_moov, b"mvhd")?.to_vec();
     let mut video_trak = child(video_moov, b"trak")?.to_vec();
@@ -354,6 +369,29 @@ fn merge_initialization(
     patch_trak_track_id(&mut audio_trak, AUDIO_TRACK_ID)?;
     patch_full_box_u32(&mut video_trex, 12, VIDEO_TRACK_ID)?;
     patch_full_box_u32(&mut audio_trex, 12, AUDIO_TRACK_ID)?;
+
+    // Bilibili 的 fragmented MP4 会把总时长放在 sidx，而 moov 中的
+    // duration 通常是 0。我们不会把单轨 sidx 原样拼进双轨文件，但必须
+    // 将其中的时长写入初始化段，否则部分 DLNA renderer（Kodi）只会根据
+    // 第一个片段推断出约 5 秒的总时长，进而触发错误的自动切歌。
+    if let (Some(video_sidx), Some(audio_sidx)) = (video_sidx, audio_sidx) {
+        let movie_timescale = mvhd_timescale(&mvhd)?;
+        let video_duration =
+            scale_duration(video_sidx.duration, video_sidx.timescale, movie_timescale)?;
+        let audio_duration =
+            scale_duration(audio_sidx.duration, audio_sidx.timescale, movie_timescale)?;
+        patch_header_duration(&mut mvhd, video_duration.max(audio_duration))?;
+        patch_trak_duration(&mut video_trak, video_sidx, movie_timescale)?;
+        patch_trak_duration(&mut audio_trak, audio_sidx, movie_timescale)?;
+        log::info!(
+            target: "DLNA1080",
+            "已写入 DASH 完整时长: video={:.3}s, audio={:.3}s",
+            video_sidx.duration as f64 / video_sidx.timescale as f64,
+            audio_sidx.duration as f64 / audio_sidx.timescale as f64
+        );
+    } else {
+        log::warn!(target: "DLNA1080", "DASH 初始化段缺少 sidx 时长索引，设备可能暂时显示错误总时长");
+    }
 
     let mvex = make_box(b"mvex", &[&video_trex, &audio_trex])?;
     let moov = make_box(b"moov", &[&mvhd, &video_trak, &audio_trak, &mvex])?;
@@ -406,6 +444,97 @@ fn track_timescale(moov: &[u8]) -> io::Result<u32> {
     }
 }
 
+fn mvhd_timescale(mvhd: &[u8]) -> io::Result<u32> {
+    let header = box_header_len(mvhd)?;
+    let version = *mvhd.get(header).ok_or_else(|| invalid("short mvhd"))?;
+    let offset = if version == 1 {
+        header + 20
+    } else {
+        header + 12
+    };
+    let timescale = read_u32(mvhd, offset)?;
+    if timescale == 0 {
+        Err(invalid("zero movie timescale"))
+    } else {
+        Ok(timescale)
+    }
+}
+
+fn patch_trak_duration(trak: &mut [u8], sidx: SidxInfo, movie_timescale: u32) -> io::Result<()> {
+    let tkhd = child_range(trak, 0..trak.len(), b"tkhd")?;
+    let mdia = child_range(trak, 0..trak.len(), b"mdia")?;
+    let mdhd = child_range(trak, mdia, b"mdhd")?;
+    let media_timescale = {
+        let header = box_header_len(&trak[mdhd.clone()])?;
+        let version = *trak
+            .get(mdhd.start + header)
+            .ok_or_else(|| invalid("short mdhd"))?;
+        read_u32(
+            trak,
+            mdhd.start
+                + if version == 1 {
+                    header + 20
+                } else {
+                    header + 12
+                },
+        )?
+    };
+    if media_timescale == 0 {
+        return Err(invalid("zero media timescale"));
+    }
+    let media_duration = scale_duration(sidx.duration, sidx.timescale, media_timescale)?;
+    patch_header_duration(&mut trak[mdhd], media_duration)?;
+    let movie_duration = scale_duration(sidx.duration, sidx.timescale, movie_timescale)?;
+    patch_tkhd_duration(&mut trak[tkhd], movie_duration)?;
+    Ok(())
+}
+
+fn scale_duration(duration: u64, source_timescale: u32, target_timescale: u32) -> io::Result<u64> {
+    if source_timescale == 0 || target_timescale == 0 {
+        return Err(invalid("zero duration timescale"));
+    }
+    u64::try_from((duration as u128) * (target_timescale as u128) / (source_timescale as u128))
+        .map_err(|_| invalid("duration overflow"))
+}
+
+fn patch_header_duration(atom: &mut [u8], duration: u64) -> io::Result<()> {
+    let header = box_header_len(atom)?;
+    let version = *atom.get(header).ok_or_else(|| invalid("short full box"))?;
+    let offset = if version == 1 {
+        header + 24
+    } else {
+        header + 16
+    };
+    if version == 1 {
+        patch_u64(atom, offset, duration)
+    } else {
+        patch_at(
+            atom,
+            offset,
+            u32::try_from(duration).map_err(|_| invalid("v0 duration overflow"))?,
+        )
+    }
+}
+
+fn patch_tkhd_duration(atom: &mut [u8], duration: u64) -> io::Result<()> {
+    let header = box_header_len(atom)?;
+    let version = *atom.get(header).ok_or_else(|| invalid("short tkhd"))?;
+    let offset = if version == 1 {
+        header + 28
+    } else {
+        header + 20
+    };
+    if version == 1 {
+        patch_u64(atom, offset, duration)
+    } else {
+        patch_at(
+            atom,
+            offset,
+            u32::try_from(duration).map_err(|_| invalid("v0 duration overflow"))?,
+        )
+    }
+}
+
 fn patch_trak_track_id(trak: &mut [u8], track_id: u32) -> io::Result<()> {
     let tkhd = child_range(trak, 0..trak.len(), b"tkhd")?;
     let version = *trak
@@ -433,6 +562,14 @@ fn patch_full_box_u32(atom: &mut [u8], offset: usize, value: u32) -> io::Result<
 fn patch_at(data: &mut [u8], offset: usize, value: u32) -> io::Result<()> {
     let dst = data
         .get_mut(offset..offset + 4)
+        .ok_or_else(|| invalid("box patch out of bounds"))?;
+    dst.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn patch_u64(data: &mut [u8], offset: usize, value: u64) -> io::Result<()> {
+    let dst = data
+        .get_mut(offset..offset + 8)
         .ok_or_else(|| invalid("box patch out of bounds"))?;
     dst.copy_from_slice(&value.to_be_bytes());
     Ok(())
@@ -480,24 +617,34 @@ fn make_box(kind: &[u8; 4], children: &[&[u8]]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn parse_sidx_referenced_bytes(sidx: &[u8]) -> io::Result<u64> {
+fn parse_sidx(sidx: &[u8]) -> io::Result<SidxInfo> {
     let header = box_header_len(sidx)?;
     let version = *sidx.get(header).ok_or_else(|| invalid("short sidx"))?;
+    let timescale = read_u32(sidx, header + 8)?;
+    if timescale == 0 {
+        return Err(invalid("zero sidx timescale"));
+    }
     let mut offset = header + 4 + 4 + 4;
     offset += if version == 0 { 8 } else { 16 };
     offset += 2;
     let count = read_u16(sidx, offset)? as usize;
     offset += 2;
     let mut total = 0u64;
+    let mut duration = 0u64;
     for _ in 0..count {
         let reference = read_u32(sidx, offset)?;
         if reference >> 31 != 0 {
             return Err(invalid("nested sidx reference unsupported"));
         }
         total += (reference & 0x7fff_ffff) as u64;
+        duration += read_u32(sidx, offset + 4)? as u64;
         offset += 12;
     }
-    Ok(total)
+    Ok(SidxInfo {
+        referenced_bytes: total,
+        duration,
+        timescale,
+    })
 }
 
 fn atom_type(data: &[u8]) -> io::Result<&[u8]> {
@@ -586,6 +733,61 @@ mod tests {
             safe_endpoint("https://upos-sz.example.com/path/video.m4s?deadline=123&token=secret");
         assert_eq!(endpoint, "https://upos-sz.example.com/path/video.m4s");
         assert!(!endpoint.contains("secret"));
+    }
+
+    #[test]
+    fn parses_sidx_media_size_and_full_duration() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        body.extend_from_slice(&1u32.to_be_bytes()); // reference_ID
+        body.extend_from_slice(&1_000u32.to_be_bytes()); // timescale
+        body.extend_from_slice(&0u32.to_be_bytes()); // earliest_presentation_time
+        body.extend_from_slice(&0u32.to_be_bytes()); // first_offset
+        body.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        body.extend_from_slice(&2u16.to_be_bytes()); // reference_count
+        for (size, duration) in [(120u32, 5_000u32), (80u32, 4_000u32)] {
+            body.extend_from_slice(&size.to_be_bytes());
+            body.extend_from_slice(&duration.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes()); // SAP flags
+        }
+        let sidx = make_box(b"sidx", &[&body]).unwrap();
+
+        let parsed = parse_sidx(&sidx).unwrap();
+        assert_eq!(parsed.referenced_bytes, 200);
+        assert_eq!(parsed.duration, 9_000);
+        assert_eq!(parsed.timescale, 1_000);
+    }
+
+    #[test]
+    fn patches_v0_movie_header_duration() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        body.extend_from_slice(&0u32.to_be_bytes()); // creation time
+        body.extend_from_slice(&0u32.to_be_bytes()); // modification time
+        body.extend_from_slice(&1_000u32.to_be_bytes()); // timescale
+        body.extend_from_slice(&0u32.to_be_bytes()); // duration
+        body.resize(100, 0);
+        let mut mvhd = make_box(b"mvhd", &[&body]).unwrap();
+
+        assert_eq!(mvhd_timescale(&mvhd).unwrap(), 1_000);
+        patch_header_duration(&mut mvhd, 285_000).unwrap();
+        assert_eq!(read_u32(&mvhd, 24).unwrap(), 285_000);
+    }
+
+    #[test]
+    fn patches_v0_track_header_duration() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
+        body.extend_from_slice(&0u32.to_be_bytes()); // creation time
+        body.extend_from_slice(&0u32.to_be_bytes()); // modification time
+        body.extend_from_slice(&1u32.to_be_bytes()); // track id
+        body.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        body.extend_from_slice(&0u32.to_be_bytes()); // duration
+        body.resize(100, 0);
+        let mut tkhd = make_box(b"tkhd", &[&body]).unwrap();
+
+        patch_tkhd_duration(&mut tkhd, 285_000).unwrap();
+        assert_eq!(read_u32(&tkhd, 28).unwrap(), 285_000);
     }
 
     /// Full network fixture used manually before releases. The output stays in
