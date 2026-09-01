@@ -90,10 +90,13 @@ Bilibili 的新视频通常只为较低清晰度保留带声音的完整 MP4。�
 音频: [ftyp][moov(audio)][sidx][moof][mdat][moof][mdat] ...
 ```
 
-- `moov`：轨道初始化信息、编码参数和时间基。
-- `sidx`：后续媒体片段索引，可计算输出总长度。
-- `moof`：一个媒体片段的样本索引和解码时间。
-- `mdat`：已经编码好的 H.264 或 AAC 样本数据。
+- `ftyp`（File Type Box，文件类型框）：声明这是哪种 MP4 文件，以及播放器应按哪些兼容规则解析。
+- `moov`（Movie Box，媒体总目录框）：保存轨道初始化信息、编码参数和时间基，不包含实际音视频数据。
+- `sidx`（Segment Index Box，片段索引框）：记录后续媒体片段的位置、大小和时长，可用于计算输出总长度。
+- `moof`（Movie Fragment Box，媒体分片框）：记录一个媒体片段中的样本索引、所属轨道和解码时间。
+- `mdat`（Media Data Box，媒体数据框）：保存已经编码好的 H.264 视频样本或 AAC 音频样本。
+
+这里的 `box`（框）是 MP4 的基本数据单元：每个框都有长度、四字符类型和内容。`ftyp`、`moov`、`trak` 等四字符名称是 ISO BMFF 标准定义的框类型代码，并不是本项目自行发明的缩写。ISO BMFF 全称为 ISO Base Media File Format，即 ISO 基础媒体文件格式；MP4 和 fragmented MP4 都建立在这种结构之上。fragmented MP4 常缩写为 fMP4，中文可称为“分片式 MP4”。
 
 ## 手写混流原理
 
@@ -101,36 +104,61 @@ Bilibili 的新视频通常只为较低清晰度保留带声音的完整 MP4。�
 
 ### 1. 合并初始化段
 
+初始化段是播放器开始解码前必须先读到的文件头，由 `ftyp` 和 `moov` 组成。它只描述“有哪些轨道、各自使用什么编码和时间单位”，不保存真正的画面或声音。Bilibili 的 DASH 视频 URL 和音频 URL 是两个相互独立的单轨 MP4，因此它们原本都可以把自己的唯一轨道编号设为 `1`；合并成一个双轨 MP4 后，两个轨道编号必须唯一。
+
 ```mermaid
 flowchart TB
-    VM[video moov] --> MVHD[mvhd]
-    VM --> VTRAK[video trak, id=1]
-    VM --> VTREX[video trex, id=1]
-    AM[audio moov] --> ATRAK[audio trak, id=1]
-    AM --> ATREX[audio trex, id=1]
-    ATRAK -->|track_ID 改为 2| ATRAK2[audio trak, id=2]
-    ATREX -->|track_ID 改为 2| ATREX2[audio trex, id=2]
-    MVHD --> OUT[combined moov]
+    VM[视频 moov：视频文件总目录] --> MVHD[mvhd：媒体公共头]
+    VM --> VTRAK[视频 trak：视频轨道说明，编号 1]
+    VM --> VTREX[视频 trex：视频分片默认规则，编号 1]
+    AM[音频 moov：音频文件总目录] --> ATRAK[音频 trak：音频轨道说明，编号 1]
+    AM --> ATREX[音频 trex：音频分片默认规则，编号 1]
+    ATRAK -->|track_ID 改为 2| ATRAK2[音频 trak：音频轨道说明，编号 2]
+    ATREX -->|track_ID 改为 2| ATREX2[音频 trex：音频分片默认规则，编号 2]
+    MVHD --> OUT[合并后的 moov：双轨总目录]
     VTRAK --> OUT
     ATRAK2 --> OUT
-    VTREX --> MVEX[mvex]
+    VTREX --> MVEX[mvex：分片播放规则容器]
     ATREX2 --> MVEX
     MVEX --> OUT
 ```
 
+图中概念说明：
+
+- `mvhd`（Movie Header Box，媒体公共头框）：位于 `moov` 内，保存整个 MP4 共用的时间信息和 `next_track_ID` 等字段。
+- `trak`（Track Box，轨道框）：描述一条完整轨道。视频 `trak` 保存视频编码、分辨率和时间信息；音频 `trak` 保存音频编码、声道和采样相关信息。`trak` 是标准规定的四字符框类型，不是普通英文单词的随意缩写。
+- `tkhd`（Track Header Box，轨道头框）：位于 `trak` 内，保存这条轨道的 `track_ID`、时长，以及视频尺寸或音频音量等基础属性。
+- `mdia`（Media Box，轨道媒体信息框）：位于 `trak` 内，容纳该轨道更具体的媒体类型、时间基和样本描述。
+- `mdhd`（Media Header Box，轨道媒体头框）：位于 `mdia` 内，保存该轨道自己的 `timescale` 和时长。
+- `mvex`（Movie Extends Box，媒体分片扩展框）：位于 `moov` 内，表示后续数据会以分片形式出现，并集中保存各轨道的分片默认规则。
+- `trex`（Track Extends Box，轨道分片扩展框）：位于 `mvex` 内，为某一条轨道声明后续分片的默认样本时长、大小和标志等规则。播放器依靠其中的 `track_ID` 判断这套规则属于视频还是音频。
+- `track_ID`（轨道编号）：MP4 内部用于关联“轨道说明”和“媒体分片”的正整数。它不是清晰度编号，也不是 Bilibili 的视频质量编号；同一个 MP4 中不能有两个轨道使用相同编号。
+- `next_track_ID`（下一个可用轨道编号）：提示后续若再增加轨道，应从哪个编号开始。合并后已使用 `1` 和 `2`，所以设为 `3`。
+- `timescale`（时间刻度）：表示“一秒包含多少个时间单位”。例如 `timescale=16000` 时，时间值 `32000` 代表 2 秒。时长必须除以对应轨道的 `timescale` 才是秒数。
+
+合并时按以下规则处理轨道编号：
+
+1. 视频轨道继续使用 `track_ID=1`。
+2. 音频轨道从 `track_ID=1` 改为 `track_ID=2`。
+3. 音频 `trak` 中 `tkhd.track_ID`、音频 `trex.track_ID`，以及后续每个音频分片中的轨道编号都必须一起改为 `2`。如果只修改其中一处，播放器就无法把音频分片归到音频轨道。
+4. `mvhd.next_track_ID` 改为 `3`，表示编号 `1` 和 `2` 已被占用。
+
 输出初始化段：
 
 ```text
-[video ftyp]
-[moov
-  [mvhd next_track_ID=3]
-  [video trak track_ID=1]
-  [audio trak track_ID=2]
-  [mvex [video trex=1] [audio trex=2]]
+[video ftyp]                         # 沿用视频文件的 MP4 类型声明
+[moov                                # 新建的双轨媒体总目录
+  [mvhd next_track_ID=3]             # 整个 MP4 的公共头，下一个可用轨道编号为 3
+  [video trak track_ID=1]            # 视频轨道说明，编号保持为 1
+  [audio trak track_ID=2]            # 音频轨道说明，编号从 1 改为 2
+  [mvex                               # 后续分片的默认规则容器
+    [video trex track_ID=1]           # 视频分片默认规则属于轨道 1
+    [audio trex track_ID=2]           # 音频分片默认规则改为属于轨道 2
+  ]
 ]
 ```
 
-所有 patch 都是定长字段修改，不会改变子 box 大小。
+这里的 patch 指“在原有二进制数据中原位修改字段”。`track_ID`、`next_track_ID` 和时长等字段的字节宽度固定，因此修改数值不会改变任何子 `box` 的大小，也不需要解码或重新编码 H.264/AAC 数据。
 
 ### 2. 按时间戳交错片段
 
@@ -162,6 +190,15 @@ sequenceDiagram
 - 音频 `tfhd.track_ID`：`1 → 2`。
 - 所有 `mfhd.sequence_number`：改成一个全局递增序列。
 - `mdat`：原样输出，媒体字节不做任何修改。
+
+本节新增术语说明：
+
+- `fragment`（媒体片段）：一小段可独立定位解码时间的音频或视频数据，通常由一个 `moof` 和紧随其后的一个 `mdat` 组成。
+- `mfhd`（Movie Fragment Header Box，媒体分片头框）：位于 `moof` 内；其中的 `sequence_number` 是分片序号。合并两条流后统一重新编号，避免视频流和音频流出现重复序号。
+- `traf`（Track Fragment Box，轨道分片框）：位于 `moof` 内，保存某一条轨道在当前片段中的信息。
+- `tfhd`（Track Fragment Header Box，轨道分片头框）：位于 `traf` 内；其中的 `track_ID` 指明当前片段属于哪条轨道，因此音频分片必须从轨道 `1` 改为轨道 `2`。
+- `tfdt`（Track Fragment Decode Time Box，轨道分片解码时间框）：位于 `traf` 内；其中的 `baseMediaDecodeTime` 是当前片段第一个样本的解码起始时间，单位是该轨道自己的 `timescale`，不是秒。
+- `decode time`（解码时间）：解码器应开始处理样本的时间。它可能与最终画面显示时间不同，但足以用于本实现按时间顺序交错视频和音频片段。
 
 ### 3. 流式与内存边界
 
