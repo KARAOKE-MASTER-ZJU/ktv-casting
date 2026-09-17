@@ -1,6 +1,6 @@
 [package]
 name = "ktv-casting"
-version = "0.1.0"
+version = "1.9.0-dev.dlna-seek.1"
 edition = "2024"
 
 [lib]

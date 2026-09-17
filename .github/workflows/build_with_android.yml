@@ -145,6 +145,7 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-dev.') }}
 
 #  dispatch-to-android:
 #    name: Dispatch Android App Build
