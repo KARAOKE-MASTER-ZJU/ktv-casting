@@ -36,6 +36,8 @@ pub mod cast;
 pub mod dlna_controller;
 pub mod fmp4_mux;
 pub mod seekable_mp4;
+pub mod song_cache;
+pub mod virtual_mp4_http;
 pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;

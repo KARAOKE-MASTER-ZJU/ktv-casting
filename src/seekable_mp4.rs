@@ -727,4 +727,160 @@ mod tests {
             assert!(builder(false).add_fragment(0, 100, &good[..end]).is_err());
         }
     }
+
+    #[actix_web::test]
+    async fn http_head_partial_header_and_unsatisfiable_range() {
+        use crate::{
+            song_cache::{BLOCK_BYTES, RemoteSource, SongCache},
+            virtual_mp4_http::serve,
+        };
+        use actix_web::{
+            body::to_bytes,
+            http::{Method, StatusCode},
+            test::TestRequest,
+        };
+        use std::sync::Arc;
+        let mut b = builder(false);
+        b.add_fragment(0, 100, &fragment(0, ints(&[1, 3, 100])))
+            .unwrap();
+        let mp4 = Arc::new(b.finish().unwrap());
+        // Requests in this test must never need a network connection.
+        let cache = Arc::new(
+            SongCache::new(
+                &std::env::temp_dir(),
+                reqwest::Client::new(),
+                vec![RemoteSource {
+                    url: "http://127.0.0.1:1/unreachable".into(),
+                    len: 209,
+                }],
+                BLOCK_BYTES,
+            )
+            .unwrap(),
+        );
+        let req = TestRequest::default()
+            .method(Method::HEAD)
+            .insert_header(("Range", "bytes=0-9"))
+            .to_http_request();
+        let response = serve(&req, mp4.clone(), cache.clone(), 42);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            mp4.len.to_string()
+        );
+        assert!(to_bytes(response.into_body()).await.unwrap().is_empty());
+        let req = TestRequest::default()
+            .insert_header(("Range", "bytes=3-12"))
+            .to_http_request();
+        let response = serve(&req, mp4.clone(), cache.clone(), 42);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 3-12/{}", mp4.len)
+        );
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            mp4.prefix.slice(3..13)
+        );
+        let req = TestRequest::default()
+            .insert_header(("Range", format!("bytes={}-", mp4.len)))
+            .to_http_request();
+        assert_eq!(
+            serve(&req, mp4.clone(), cache.clone(), 42).status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        let req = TestRequest::default()
+            .insert_header(("Range", "bytes=3-12"))
+            .insert_header(("If-Range", "\"old-file\""))
+            .to_http_request();
+        assert_eq!(
+            serve(&req, mp4.clone(), cache.clone(), 42).status(),
+            StatusCode::OK
+        );
+        let req = TestRequest::default()
+            .insert_header(("If-None-Match", "W/\"ktv-42\""))
+            .to_http_request();
+        assert_eq!(
+            serve(&req, mp4, cache.clone(), 42).status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(cache.stats().0, 0);
+    }
+
+    #[actix_web::test]
+    async fn http_full_and_cross_boundary_ranges_stream_identical_media() {
+        use crate::{
+            song_cache::{BLOCK_BYTES, RemoteSource, SongCache},
+            virtual_mp4_http::serve,
+        };
+        use actix_web::{body::to_bytes, http::StatusCode, test::TestRequest};
+        use std::sync::Arc;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/fixture", listener.local_addr().unwrap());
+        let origin = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut b = [0; 512];
+                let n = socket.read(&mut b).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&b[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let mut response = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-208/209\r\nContent-Length: 209\r\nConnection: close\r\n\r\n".to_vec();
+            response.extend_from_slice(&[0; 200]);
+            response.extend_from_slice(b"abcdefghi");
+            socket.write_all(&response).await.unwrap();
+        });
+        let cache = Arc::new(
+            SongCache::new(
+                &std::env::temp_dir(),
+                reqwest::Client::new(),
+                vec![RemoteSource { url, len: 209 }],
+                BLOCK_BYTES,
+            )
+            .unwrap(),
+        );
+        let mut b = builder(false);
+        b.add_fragment(0, 100, &fragment(0, ints(&[1, 3, 100])))
+            .unwrap();
+        let mp4 = Arc::new(b.finish().unwrap());
+        let full = serve(
+            &TestRequest::default().to_http_request(),
+            mp4.clone(),
+            cache.clone(),
+            43,
+        );
+        let data = to_bytes(full.into_body()).await.unwrap();
+        assert_eq!(&data[..mp4.prefix.len()], &mp4.prefix[..]);
+        assert_eq!(&data[mp4.prefix.len()..], b"abcdefghi");
+        origin.await.unwrap();
+        let start = mp4.prefix.len() - 3;
+        let req = TestRequest::default()
+            .insert_header(("Range", format!("bytes={start}-{}", start + 7)))
+            .to_http_request();
+        let response = serve(&req, mp4.clone(), cache.clone(), 43);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            data.slice(start..start + 8)
+        );
+        // Origin has exited: this second request must come entirely from the cache.
+        assert_eq!(cache.stats().0, 1);
+    }
 }
