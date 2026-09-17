@@ -17,6 +17,7 @@ use std::{
 use tokio::sync::{Mutex, OnceCell, Semaphore, watch};
 
 pub const BLOCK_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_CACHE_BLOCK_BYTES: u64 = 128 * 1024;
 const HOT_BLOCKS: usize = 4;
 type Key = (usize, u64);
 static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +57,8 @@ pub struct SongCache {
     blocks: Mutex<HashMap<Key, Arc<Block>>>,
     hot: Mutex<VecDeque<(Key, Bytes)>>,
     block_limit: usize,
+    block_bytes: u64,
+    hot_limit: usize,
     parallel: Arc<Semaphore>,
     cancelled: watch::Sender<bool>,
     tick: AtomicU64,
@@ -77,7 +80,23 @@ impl SongCache {
         sources: Vec<RemoteSource>,
         capacity: u64,
     ) -> io::Result<Self> {
-        let block_limit = usize::try_from(capacity / BLOCK_BYTES)
+        Self::new_with_block_size(parent, client, sources, capacity, DEFAULT_CACHE_BLOCK_BYTES)
+    }
+
+    pub fn new_with_block_size(
+        parent: &Path,
+        client: reqwest::Client,
+        sources: Vec<RemoteSource>,
+        capacity: u64,
+        block_bytes: u64,
+    ) -> io::Result<Self> {
+        if !(16 * 1024..=BLOCK_BYTES).contains(&block_bytes) || !block_bytes.is_power_of_two() {
+            return Err(error(
+                io::ErrorKind::InvalidInput,
+                "invalid cache block size",
+            ));
+        }
+        let block_limit = usize::try_from(capacity / block_bytes)
             .map_err(|_| error(io::ErrorKind::InvalidInput, "cache capacity too large"))?;
         if block_limit == 0 || sources.is_empty() || sources.iter().any(|s| s.len == 0) {
             return Err(error(
@@ -103,6 +122,8 @@ impl SongCache {
             blocks: Mutex::new(HashMap::new()),
             hot: Mutex::new(VecDeque::new()),
             block_limit,
+            block_bytes,
+            hot_limit: ((HOT_BLOCKS as u64 * BLOCK_BYTES) / block_bytes) as usize,
             parallel: Arc::new(Semaphore::new(4)),
             cancelled,
             tick: AtomicU64::new(0),
@@ -121,7 +142,7 @@ impl SongCache {
         )
     }
 
-    /// Read at most one block of data. Cross-boundary requests are split internally.
+    /// Read at most 1MiB of data. Cross-block requests are split internally.
     /// Larger virtual responses should stream these pieces instead of accumulating.
     pub async fn read(&self, source: usize, range: Range<u64>) -> io::Result<Bytes> {
         let remote = self
@@ -145,16 +166,26 @@ impl SongCache {
             biased;
             _ = stop.changed() => Err(cancelled()),
             result = async {
-                let mut output = BytesMut::with_capacity((range.end - range.start) as usize);
-                let mut offset = range.start;
-                while offset < range.end {
-                    let block_number = offset / BLOCK_BYTES;
-                    let bytes = self.block((source, block_number)).await?;
-                    let start = (offset % BLOCK_BYTES) as usize;
-                    let count = ((range.end - offset) as usize).min(bytes.len() - start);
-                    output.extend_from_slice(&bytes[start..start+count]);
-                    offset += count as u64;
+                if range.is_empty() { return Ok(Bytes::new()); }
+                let first = range.start/self.block_bytes;
+                let last = (range.end-1)/self.block_bytes;
+                if first == last {
+                    let bytes = self.block((source, first)).await?;
+                    let base = first*self.block_bytes;
+                    return Ok(bytes.slice((range.start-base) as usize..(range.end-base) as usize));
                 }
+                // A large keyframe can span several cache blocks. Fetch those
+                // concurrently instead of adding a network RTT for each block.
+                // Tiny test/cache configurations cannot pin more blocks than fit.
+                let mut reads = futures_util::stream::iter(first..=last).map(|number| async move {
+                    let bytes = self.block((source, number)).await?;
+                    let base = number*self.block_bytes;
+                    let start = range.start.max(base)-base;
+                    let end = range.end.min(base+self.block_bytes)-base;
+                    Ok::<_, io::Error>(bytes.slice(start as usize..end as usize))
+                }).buffered(4.min(self.block_limit));
+                let mut output = BytesMut::with_capacity((range.end - range.start) as usize);
+                while let Some(bytes) = reads.next().await { output.extend_from_slice(&bytes?); }
                 Ok(output.freeze())
             } => result,
         }
@@ -215,8 +246,8 @@ impl SongCache {
                     .await
                     .map_err(|_| cancelled())?;
                 let remote = &self.sources[key.0];
-                let start = key.1 * BLOCK_BYTES;
-                let end = start.saturating_add(BLOCK_BYTES).min(remote.len);
+                let start = key.1 * self.block_bytes;
+                let end = start.saturating_add(self.block_bytes).min(remote.len);
                 self.requests.fetch_add(1, Ordering::Relaxed);
                 let bytes = fetch_range(&self.client, &remote.url, start..end, remote.len).await?;
                 // A dropped async filesystem write can continue on Tokio's worker.
@@ -240,7 +271,7 @@ impl SongCache {
             self.hits.fetch_add(1, Ordering::Relaxed);
         }
         let bytes = Bytes::from(tokio::fs::read(&block.path).await?);
-        let expected = (self.sources[key.0].len - key.1 * BLOCK_BYTES).min(BLOCK_BYTES);
+        let expected = (self.sources[key.0].len - key.1 * self.block_bytes).min(self.block_bytes);
         if bytes.len() as u64 != expected {
             return Err(error(
                 io::ErrorKind::InvalidData,
@@ -250,7 +281,7 @@ impl SongCache {
         let mut hot = self.hot.lock().await;
         hot.retain(|(k, _)| *k != key);
         hot.push_back((key, bytes.clone()));
-        while hot.len() > HOT_BLOCKS.min(self.block_limit) {
+        while hot.len() > self.hot_limit.min(self.block_limit) {
             hot.pop_front();
         }
         Ok(bytes)
@@ -332,6 +363,15 @@ mod tests {
     }
 
     async fn origin(data: Bytes, status: u16, delay: bool) -> Origin {
+        origin_with_gate(data, status, delay, None).await
+    }
+
+    async fn origin_with_gate(
+        data: Bytes,
+        status: u16,
+        delay: bool,
+        gate: Option<Arc<tokio::sync::Barrier>>,
+    ) -> Origin {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/media", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicU64::new(0));
@@ -341,6 +381,7 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let data = data.clone();
                 let count = count.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut chunk = [0; 1024];
@@ -352,6 +393,9 @@ mod tests {
                         request.extend_from_slice(&chunk[..n]);
                     }
                     count.fetch_add(1, Ordering::Relaxed);
+                    if let Some(gate) = gate {
+                        gate.wait().await;
+                    }
                     if delay {
                         std::future::pending::<()>().await;
                     }
@@ -381,7 +425,7 @@ mod tests {
     }
 
     fn cache(server: &Origin, length: u64, blocks: u64) -> SongCache {
-        SongCache::new(
+        SongCache::new_with_block_size(
             &std::env::temp_dir(),
             reqwest::Client::new(),
             vec![RemoteSource {
@@ -389,6 +433,7 @@ mod tests {
                 len: length,
             }],
             blocks * BLOCK_BYTES,
+            BLOCK_BYTES,
         )
         .unwrap()
     }
@@ -476,5 +521,38 @@ mod tests {
         assert!(cache.read(0, 0..5).await.is_err());
         assert_eq!(server.requests.load(Ordering::Relaxed), 2);
         assert_eq!(std::fs::read_dir(&cache.directory.0).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn keyframe_spanning_blocks_fetches_them_concurrently() {
+        let block_bytes = 64 * 1024;
+        let data = Bytes::from(vec![37; block_bytes as usize * 2]);
+        // Neither response can finish until BOTH requests reach the server.
+        // A serial cross-block reader deadlocks and fails the bounded test.
+        let server = origin_with_gate(
+            data.clone(),
+            206,
+            false,
+            Some(Arc::new(tokio::sync::Barrier::new(2))),
+        )
+        .await;
+        let cache = SongCache::new_with_block_size(
+            &std::env::temp_dir(),
+            reqwest::Client::new(),
+            vec![RemoteSource {
+                url: server.url.clone(),
+                len: data.len() as u64,
+            }],
+            BLOCK_BYTES,
+            block_bytes,
+        )
+        .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), cache.read(0, 0..data.len() as u64))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(result, data);
+        assert_eq!(server.requests.load(Ordering::Relaxed), 2);
     }
 }

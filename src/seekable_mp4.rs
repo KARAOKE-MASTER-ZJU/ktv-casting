@@ -150,6 +150,7 @@ pub struct Mp4Builder {
     ftyp: Vec<u8>,
     mvhd: Vec<u8>,
     tracks: Vec<Track>,
+    sample_count: usize,
 }
 
 impl Mp4Builder {
@@ -158,6 +159,7 @@ impl Mp4Builder {
             ftyp: ftyp.to_vec(),
             mvhd: child(moov, b"mvhd")?.to_vec(),
             tracks: Vec::new(),
+            sample_count: 0,
         };
         result.add_source(moov, source)?;
         Ok(result)
@@ -263,8 +265,12 @@ impl Mp4Builder {
                 }
                 let flags = u32_at(trun, rh)? & 0xffffff;
                 let count = u32_at(trun, rh + 4)?;
-                if count > 1_000_000 {
-                    return Err(invalid("too many samples in run"));
+                self.sample_count = self
+                    .sample_count
+                    .checked_add(count as usize)
+                    .ok_or_else(|| invalid("sample count overflow"))?;
+                if self.sample_count > 1_000_000 {
+                    return Err(invalid("sample index exceeds memory budget"));
                 }
                 let mut p = rh + 8;
                 if flags & 1 != 0 {
@@ -327,6 +333,31 @@ impl Mp4Builder {
                         .ok_or_else(|| invalid("decode time overflow"))?;
                 }
                 cursor = Some(offset);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every newly indexed sample against its segment's mdat payload.
+    /// On any parse/validation error the builder must be discarded.
+    pub fn add_fragment_in_media(
+        &mut self,
+        source: usize,
+        offset: u64,
+        moof: &[u8],
+        media: Range<u64>,
+    ) -> io::Result<()> {
+        let before: Vec<_> = self.tracks.iter().map(|t| t.samples.len()).collect();
+        self.add_fragment(source, offset, moof)?;
+        for (track, count) in self.tracks.iter().zip(before) {
+            for sample in &track.samples[count..] {
+                let end = sample
+                    .offset
+                    .checked_add(sample.size as u64)
+                    .ok_or_else(|| invalid("sample end overflow"))?;
+                if sample.offset < media.start || end > media.end {
+                    return Err(invalid("sample exceeds its media payload"));
+                }
             }
         }
         Ok(())
@@ -530,6 +561,21 @@ pub enum ReadPart {
 }
 
 impl VirtualMp4 {
+    pub fn validate_sources(&self, lengths: &[u64]) -> io::Result<()> {
+        for extent in &self.extents {
+            let length = *lengths
+                .get(extent.source)
+                .ok_or_else(|| invalid("missing media source"))?;
+            let end = extent
+                .source_start
+                .checked_add(extent.output.end - extent.output.start)
+                .ok_or_else(|| invalid("source range overflow"))?;
+            if end > length {
+                return Err(invalid("sample data exceeds source file"));
+            }
+        }
+        Ok(())
+    }
     /// Translate an exact half-open output range into source ranges, without I/O.
     pub fn read_plan(&self, range: Range<u64>) -> io::Result<Vec<ReadPart>> {
         if range.start > range.end || range.end > self.len {
@@ -726,6 +772,30 @@ mod tests {
         for end in 0..good.len() {
             assert!(builder(false).add_fragment(0, 100, &good[..end]).is_err());
         }
+    }
+
+    #[test]
+    fn samples_must_stay_inside_their_own_payload() {
+        let moof = fragment(0, ints(&[1, 3, 100]));
+        builder(false)
+            .add_fragment_in_media(0, 100, &moof, 200..209)
+            .unwrap();
+        assert!(
+            builder(false)
+                .add_fragment_in_media(0, 100, &moof, 201..209)
+                .is_err()
+        );
+        assert!(
+            builder(false)
+                .add_fragment_in_media(0, 100, &moof, 200..208)
+                .is_err()
+        );
+        let mut b = builder(false);
+        b.add_fragment(0, 100, &moof).unwrap();
+        let mp4 = b.finish().unwrap();
+        mp4.validate_sources(&[209]).unwrap();
+        assert!(mp4.validate_sources(&[208]).is_err());
+        assert!(mp4.validate_sources(&[]).is_err());
     }
 
     #[actix_web::test]

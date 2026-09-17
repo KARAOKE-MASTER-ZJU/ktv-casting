@@ -5,7 +5,8 @@ use crate::{
     song_cache::{BLOCK_BYTES, SongCache},
 };
 use actix_web::{HttpRequest, HttpResponse, http::Method};
-use std::{collections::VecDeque, io, ops::Range, sync::Arc};
+use futures_util::StreamExt;
+use std::{ops::Range, sync::Arc};
 
 #[derive(Debug, PartialEq, Eq)]
 enum RequestedRange {
@@ -124,36 +125,47 @@ pub fn serve(
         return response.finish();
     }
     let parts = match mp4.read_plan(range.clone()) {
-        Ok(parts) => VecDeque::from(parts),
+        Ok(parts) => parts,
         Err(e) => {
             log::error!(target: "DLNA1080", "MP4 字节映射失败: {}", e);
             return HttpResponse::InternalServerError().finish();
         }
     };
     log::debug!(target: "DLNA1080", "MP4 范围请求: generation={}, start={}, end={}", generation, range.start, range.end);
-    let stream = futures_util::stream::try_unfold(
-        (parts, mp4, cache),
-        |(mut parts, mp4, cache)| async move {
-            let Some(part) = parts.pop_front() else {
-                return Ok::<_, io::Error>(None);
-            };
-            let bytes = match part {
-                ReadPart::Header(range) => mp4.prefix.slice(range),
-                ReadPart::Source { source, range } => {
-                    let end = range.end.min(range.start.saturating_add(BLOCK_BYTES));
-                    let bytes = cache.read(source, range.start..end).await?;
-                    if end < range.end {
-                        parts.push_front(ReadPart::Source {
-                            source,
-                            range: end..range.end,
-                        });
-                    }
-                    bytes
+    // Poll ahead across interleaved video/audio samples, while preserving exact
+    // output order. The source cache deduplicates identical block requests and
+    // bounds network concurrency. Dropping this stream cancels its read-ahead.
+    let parts = parts.into_iter().flat_map(|part| {
+        let mut part = Some(part);
+        std::iter::from_fn(move || match part.take()? {
+            ReadPart::Header(r) => Some(ReadPart::Header(r)),
+            ReadPart::Source { source, range } => {
+                let end = range.end.min(range.start.saturating_add(BLOCK_BYTES));
+                if end < range.end {
+                    part = Some(ReadPart::Source {
+                        source,
+                        range: end..range.end,
+                    });
                 }
-            };
-            Ok(Some((bytes, (parts, mp4, cache))))
-        },
-    );
+                Some(ReadPart::Source {
+                    source,
+                    range: range.start..end,
+                })
+            }
+        })
+    });
+    let stream = futures_util::stream::iter(parts)
+        .map(move |part| {
+            let cache = cache.clone();
+            let mp4 = mp4.clone();
+            async move {
+                match part {
+                    ReadPart::Header(range) => Ok(mp4.prefix.slice(range)),
+                    ReadPart::Source { source, range } => cache.read(source, range).await,
+                }
+            }
+        })
+        .buffered(32);
     response.streaming(stream)
 }
 
