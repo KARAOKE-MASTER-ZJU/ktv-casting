@@ -404,6 +404,17 @@ impl Mp4Builder {
             position = end;
         }
         let moov = self.build_moov(&offsets)?;
+        // Hints only: the receiver still uses the exact MP4 sample tables for
+        // seeking. Start at a preceding video keyframe, never at an arbitrary
+        // byte estimate based on average bitrate.
+        let video = self.tracks.iter().position(|t| {
+            child(&t.trak, b"mdia").and_then(|m| child(m, b"hdlr"))
+                .is_ok_and(|h| h.get(16..20) == Some(b"vide"))
+        }).unwrap_or(0);
+        let seek_points = self.tracks[video].samples.iter().enumerate()
+            .filter(|(_, s)| s.sync)
+            .map(|(i, s)| ((s.decode_time as u128 * 1000 / self.tracks[video].timescale as u128) as u64, offsets[video][i]))
+            .collect();
         assert_eq!(moov.len(), initial_moov.len());
         let mut prefix = self.ftyp;
         prefix.extend_from_slice(&moov);
@@ -414,6 +425,7 @@ impl Mp4Builder {
             prefix: Bytes::from(prefix),
             len: position,
             extents,
+            seek_points,
         })
     }
 
@@ -552,6 +564,7 @@ pub struct VirtualMp4 {
     pub prefix: Bytes,
     pub len: u64,
     extents: Vec<Extent>,
+    seek_points: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -561,6 +574,15 @@ pub enum ReadPart {
 }
 
 impl VirtualMp4 {
+    /// A bounded warm-up window beginning at the preceding keyframe. This is
+    /// not a replacement for the renderer's precise timestamp/byte mapping.
+    pub fn seek_warmup_range(&self, seconds: u32) -> Range<u64> {
+        let target = u64::from(seconds) * 1000;
+        let index = self.seek_points.partition_point(|(ms, _)| *ms <= target);
+        let start = self.seek_points.get(index.saturating_sub(1))
+            .map_or(self.prefix.len() as u64, |(_, offset)| *offset);
+        start..start.saturating_add(2 * 1024 * 1024).min(self.len)
+    }
     pub fn validate_sources(&self, lengths: &[u64]) -> io::Result<()> {
         for extent in &self.extents {
             let length = *lengths
@@ -658,6 +680,20 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn warmup_uses_preceding_keyframe_and_clamps_to_eof() {
+        let mut b = builder(false);
+        // Explicit flags: sync, non-sync, sync at 0, 1, 2 seconds.
+        b.add_fragment(0, 100, &fragment(0, ints(&[0x401, 3, 100, 0, 0x10000, 0])))
+            .unwrap();
+        let mp4 = b.finish().unwrap();
+        let p = mp4.prefix.len() as u64;
+        assert_eq!(mp4.seek_warmup_range(0), p..mp4.len);
+        assert_eq!(mp4.seek_warmup_range(1), p..mp4.len);
+        assert_eq!(mp4.seek_warmup_range(2), p + 6..mp4.len);
+        assert_eq!(mp4.seek_warmup_range(u32::MAX), p + 6..mp4.len);
     }
 
     #[test]
@@ -884,6 +920,59 @@ mod tests {
             StatusCode::NOT_MODIFIED
         );
         assert_eq!(cache.stats().0, 0);
+    }
+
+    #[actix_web::test]
+    async fn seek_retires_a_blocked_response_and_new_range_retries_the_block() {
+        use crate::{song_cache::{SongCache, RemoteSource, BLOCK_BYTES}, virtual_mp4_http::serve};
+        use actix_web::{body::to_bytes, test::TestRequest};
+        use std::{sync::Arc, time::Duration};
+        use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/fixture", listener.local_addr().unwrap());
+        let (accepted, waiting) = tokio::sync::oneshot::channel();
+        let origin = tokio::spawn(async move {
+            let mut accepted = Some(accepted);
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut bytes = [0; 512];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                if attempt == 0 {
+                    // Hold the response until cancellation closes this request.
+                    accepted.take().unwrap().send(()).unwrap();
+                    let mut byte = [0];
+                    let closed = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte)).await.unwrap();
+                    assert!(matches!(closed, Ok(0) | Err(_)));
+                    continue;
+                }
+                let mut response = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-208/209\r\nContent-Length: 209\r\nConnection: close\r\n\r\n".to_vec();
+                response.extend_from_slice(&[0; 200]);
+                response.extend_from_slice(b"abcdefghi");
+                socket.write_all(&response).await.unwrap();
+            }
+        });
+        let cache = Arc::new(SongCache::new(&std::env::temp_dir(), reqwest::Client::new(),
+            vec![RemoteSource { url, len: 209 }], BLOCK_BYTES).unwrap());
+        let mut b = builder(false);
+        b.add_fragment(0, 100, &fragment(0, ints(&[1, 3, 100]))).unwrap();
+        let mp4 = Arc::new(b.finish().unwrap());
+        let request = TestRequest::default().insert_header(("Range", format!("bytes={}-", mp4.prefix.len()))).to_http_request();
+        let old = serve(&request, mp4.clone(), cache.clone(), 99);
+        let old_read = actix_web::rt::spawn(async move { to_bytes(old.into_body()).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+        let cutoff = cache.stream_cutoff();
+        let new = serve(&request, mp4, cache.clone(), 99);
+        cache.retire_streams(cutoff);
+        assert!(tokio::time::timeout(Duration::from_secs(2), old_read).await.unwrap().unwrap().is_empty());
+        let bytes = tokio::time::timeout(Duration::from_secs(2), to_bytes(new.into_body())).await.unwrap().unwrap();
+        assert_eq!(&bytes[..], b"abcdefghi");
+        assert_eq!(cache.stats().0, 2);
+        origin.await.unwrap();
     }
 
     #[actix_web::test]

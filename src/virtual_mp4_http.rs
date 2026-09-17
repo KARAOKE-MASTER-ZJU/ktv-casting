@@ -6,7 +6,7 @@ use crate::{
 };
 use actix_web::{HttpRequest, HttpResponse, http::Method};
 use futures_util::StreamExt;
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc, time::Instant};
 
 #[derive(Debug, PartialEq, Eq)]
 enum RequestedRange {
@@ -154,6 +154,11 @@ pub fn serve(
             }
         })
     });
+    let started = Instant::now();
+    let (stream_id, mut epoch) = cache.stream_epoch();
+    let mut emitted = 0u64;
+    let mut reported = false;
+    let range_start = range.start;
     let stream = futures_util::stream::iter(parts)
         .map(move |part| {
             let cache = cache.clone();
@@ -165,7 +170,25 @@ pub fn serve(
                 }
             }
         })
-        .buffered(32);
+        .buffered(32)
+        .inspect(move |result| {
+            if let Ok(bytes) = result {
+                if emitted == 0 {
+                    log::debug!(target: "DLNA1080", "MP4 首字节: generation={}, start={}, ready_ms={}", generation, range_start, started.elapsed().as_millis());
+                }
+                emitted += bytes.len() as u64;
+                if !reported && emitted >= 128 * 1024 {
+                    reported = true;
+                    log::debug!(target: "DLNA1080", "MP4 首128KiB: generation={}, start={}, ready_ms={}", generation, range_start, started.elapsed().as_millis());
+                }
+            }
+        })
+        .take_until(async move {
+            loop {
+                if *epoch.borrow_and_update() >= stream_id { break; }
+                if epoch.changed().await.is_err() { break; }
+            }
+        });
     response.streaming(stream)
 }
 

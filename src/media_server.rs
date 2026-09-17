@@ -2,11 +2,11 @@
 use crate::SharedState;
 use crate::bilibili_parser::{BilibiliMedia, get_bilibili_media};
 use crate::mp4_util::get_mp4_duration;
-use actix_web::{HttpRequest, HttpResponse, get, web};
+use actix_web::{HttpRequest, HttpResponse, route, web};
 use futures_util::StreamExt;
 use log::{debug, info};
 
-#[get("/{url:.*}")]
+#[route("/{url:.*}", method = "GET", method = "HEAD")]
 pub async fn proxy_handler(
     req: HttpRequest,
     path: web::Path<(String,)>,
@@ -14,8 +14,32 @@ pub async fn proxy_handler(
     shared_state: web::Data<SharedState>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (mut origin_url,) = path.into_inner();
+    // Session paths are immutable. Reject obsolete generations before resolving
+    // Bilibili URLs or allocating any cache; an old renderer retry cannot switch
+    // the current song back to an earlier one.
+    let is_session_path = origin_url.starts_with("__ktv_media/");
+    if is_session_path {
+        let Some(session) = crate::media_session::generation_from_path(&origin_url)
+            .and_then(|generation| shared_state.media_sessions.get(generation)) else {
+                return Ok(HttpResponse::Gone().finish());
+            };
+        let media = match session.prepare(client.get_ref()).await {
+            Ok(media) => media,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(HttpResponse::Gone().finish()),
+            Err(error) => {
+                log::error!(target: "DLNA1080", "媒体会话准备失败: generation={}, error={}", session.generation, error);
+                return Err(actix_web::error::ErrorBadGateway(error));
+            }
+        };
+        match media.as_ref() {
+            crate::media_session::SessionMedia::Seekable { mp4, cache } => {
+                return Ok(crate::virtual_mp4_http::serve(&req, mp4.clone(), cache.clone(), session.generation));
+            }
+            crate::media_session::SessionMedia::Direct(url) => origin_url = url.clone(),
+        }
+    }
     let query_string = req.query_string();
-    if !query_string.is_empty() {
+    if !is_session_path && !query_string.is_empty() {
         origin_url.push('?');
         origin_url.push_str(query_string);
     }
@@ -349,6 +373,26 @@ mod tests {
     use crate::media_server::proxy_handler;
     use actix_web::{App, HttpServer, web};
     use reqwest::Client;
+
+    #[actix_web::test]
+    async fn obsolete_session_head_returns_gone_without_upstream_access() {
+        use crate::{SharedState, media_session::MediaSessions, cast::Quality};
+        use std::sync::Arc;
+        let sessions = Arc::new(MediaSessions::default());
+        let old = sessions.activate("https://example.invalid/old.mp4", Quality::P720);
+        sessions.activate("https://example.invalid/current.mp4", Quality::P720);
+        let state = web::Data::new(SharedState {
+            duration_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            eplus_auth: Arc::new(tokio::sync::Mutex::new(None)),
+            media_sessions: sessions,
+        });
+        let app = actix_web::test::init_service(App::new().app_data(state).app_data(web::Data::new(Client::new())).service(proxy_handler)).await;
+        for method in [actix_web::http::Method::GET, actix_web::http::Method::HEAD] {
+            let request = actix_web::test::TestRequest::with_uri(&format!("/{}", old.path())).method(method).to_request();
+            let response = actix_web::test::call_service(&app, request).await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::GONE);
+        }
+    }
 
     #[tokio::test]
     async fn test_https() {

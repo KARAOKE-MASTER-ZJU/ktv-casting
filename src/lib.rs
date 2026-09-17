@@ -39,6 +39,7 @@ pub mod seekable_mp4;
 pub mod song_cache;
 pub mod virtual_mp4_http;
 pub mod dash_index;
+pub mod media_session;
 pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;
@@ -92,6 +93,7 @@ pub struct EngineContext {
 pub struct SharedState {
     pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
     pub eplus_auth: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub media_sessions: Arc<media_session::MediaSessions>,
 }
 
 pub(crate) fn get_best_local_ip(target_device_ip: &str) -> String {
@@ -208,11 +210,12 @@ pub async fn start_engine_core(
     info!(target: "DLNA1080", "DLNA 新会话默认清晰度: 720P");
 
     let handle = rt.handle().clone();
-    let (controller, device, local_ip_addr, port, cache, _) =
+    let (controller, device, local_ip_addr, port, cache, shared_state) =
         connect_dlna_device(loc_str, handle).await?;
 
     let caster: Arc<dyn cast::Caster> =
-        Arc::new(DlnaCaster::new(controller, device, local_ip_addr, port));
+        Arc::new(DlnaCaster::new(controller, device, local_ip_addr, port)
+            .with_sessions(shared_state.media_sessions.clone()));
 
     connect_room(base_url_str, room_id, caster, local_ip_addr, port, cache, rt).await?;
 
@@ -258,6 +261,7 @@ pub async fn connect_dlna_device(
     let shared_state = web::Data::new(SharedState {
         duration_cache: cache.clone(),
         eplus_auth: Arc::new(tokio::sync::Mutex::new(None)),
+        media_sessions: Arc::new(media_session::MediaSessions::default()),
     });
     // 通知旧服务器关闭（防止端口冲突）
     if let Ok(mut guard) = MEDIA_SERVER_SHUTDOWN.write() {

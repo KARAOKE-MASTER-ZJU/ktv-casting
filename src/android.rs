@@ -48,6 +48,9 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_initSessionDir(
     };
     if !dir_str.is_empty() {
         crate::cast::bilibili_caster::init_session_dir(&dir_str);
+        if let Err(error) = crate::media_session::init_cache_dir(&dir_str) {
+            log::error!(target: "DLNA1080", "初始化 App 媒体缓存目录失败: {}", error);
+        }
         info!("Session 目录初始化: {}", dir_str);
     }
 }

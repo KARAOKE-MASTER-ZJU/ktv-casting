@@ -61,6 +61,8 @@ pub struct SongCache {
     hot_limit: usize,
     parallel: Arc<Semaphore>,
     cancelled: watch::Sender<bool>,
+    stream_epoch: watch::Sender<u64>,
+    stream_id: AtomicU64,
     tick: AtomicU64,
     requests: AtomicU64,
     hits: AtomicU64,
@@ -126,6 +128,8 @@ impl SongCache {
             hot_limit: ((HOT_BLOCKS as u64 * BLOCK_BYTES) / block_bytes) as usize,
             parallel: Arc::new(Semaphore::new(4)),
             cancelled,
+            stream_epoch: watch::channel(0).0,
+            stream_id: AtomicU64::new(0),
             tick: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -134,12 +138,46 @@ impl SongCache {
 
     pub fn cancel(&self) {
         self.cancelled.send_replace(true);
+        self.interrupt_streams();
+    }
+    /// A deliberate seek makes existing response streams obsolete, but keeps
+    /// their completed cache blocks. New HTTP requests subscribe to the new epoch.
+    pub fn interrupt_streams(&self) {
+        self.retire_streams(self.stream_cutoff());
+    }
+    pub fn stream_cutoff(&self) -> u64 {
+        self.stream_id.load(Ordering::SeqCst)
+    }
+    pub fn retire_streams(&self, cutoff: u64) {
+        self.stream_epoch.send_modify(|epoch| *epoch = (*epoch).max(cutoff));
+    }
+    pub fn stream_epoch(&self) -> (u64, watch::Receiver<u64>) {
+        let receiver = self.stream_epoch.subscribe();
+        let id = self.stream_id.fetch_add(1, Ordering::SeqCst) + 1;
+        (id, receiver)
     }
     pub fn stats(&self) -> (u64, u64) {
         (
             self.requests.load(Ordering::Relaxed),
             self.hits.load(Ordering::Relaxed),
         )
+    }
+
+    pub(crate) fn warmup_blocks(&self, parts: Vec<crate::seekable_mp4::ReadPart>) -> Vec<(usize, Range<u64>)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut reads = Vec::new();
+        for part in parts {
+            if let crate::seekable_mp4::ReadPart::Source { source, range } = part {
+                if range.is_empty() { continue; }
+                for block in range.start / self.block_bytes..=(range.end - 1) / self.block_bytes {
+                    if seen.insert((source, block)) {
+                        let start = block * self.block_bytes;
+                        reads.push((source, start..(start + self.block_bytes).min(self.sources[source].len)));
+                    }
+                }
+            }
+        }
+        reads
     }
 
     /// Read at most 1MiB of data. Cross-block requests are split internally.
@@ -249,7 +287,9 @@ impl SongCache {
                 let start = key.1 * self.block_bytes;
                 let end = start.saturating_add(self.block_bytes).min(remote.len);
                 self.requests.fetch_add(1, Ordering::Relaxed);
+                let fetch_started = std::time::Instant::now();
                 let bytes = fetch_range(&self.client, &remote.url, start..end, remote.len).await?;
+                log::trace!(target: "DLNA1080_CACHE", "缓存未命中下载: source={}, offset={}, bytes={}, fetch_ms={}", key.0, start, bytes.len(), fetch_started.elapsed().as_millis());
                 // A dropped async filesystem write can continue on Tokio's worker.
                 // Publish atomically from a unique staging file; keep the block pinned
                 // until that worker finishes, even if the initiating read is cancelled.
@@ -350,6 +390,39 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn retiring_old_streams_does_not_cancel_new_ranges_or_the_cache() {
+        let cache = SongCache::new(&std::env::temp_dir(), reqwest::Client::new(), vec![
+            RemoteSource { url: "http://unused.invalid/video".into(), len: 1024 },
+        ], DEFAULT_CACHE_BLOCK_BYTES).unwrap();
+        let (old_id, old) = cache.stream_epoch();
+        let cutoff = cache.stream_cutoff();
+        let (new_id, new) = cache.stream_epoch();
+        cache.retire_streams(cutoff);
+        assert!(*old.borrow() >= old_id);
+        assert!(*new.borrow() < new_id);
+        assert!(!*cache.cancelled.borrow());
+        cache.retire_streams(0); // A late completion cannot move the cutoff back.
+        assert!(*old.borrow() >= old_id);
+    }
+
+    #[test]
+    fn warmup_deduplicates_interleaved_blocks_in_first_use_order() {
+        use crate::seekable_mp4::ReadPart::Source;
+        let block = DEFAULT_CACHE_BLOCK_BYTES;
+        let cache = SongCache::new(&std::env::temp_dir(), reqwest::Client::new(), vec![
+            RemoteSource { url: "http://unused.invalid/video".into(), len: block * 3 },
+            RemoteSource { url: "http://unused.invalid/audio".into(), len: block + 7 },
+        ], block * 8).unwrap();
+        let reads = cache.warmup_blocks(vec![
+            Source { source: 0, range: block - 1..block + 5 },
+            Source { source: 1, range: block..block + 7 },
+            Source { source: 0, range: block..block + 6 },
+        ]);
+        assert_eq!(reads, vec![(0, 0..block), (0, block..block * 2), (1, block..block + 7)]);
+        assert_eq!(cache.stats(), (0, 0));
+    }
 
     struct Origin {
         url: String,
