@@ -162,6 +162,15 @@ impl MediaSession {
     }
 
     async fn resolve(&self, client: &reqwest::Client) -> io::Result<SessionMedia> {
+        if crate::youtube_parser::is_youtube_url(&self.song) {
+            let max_height = match self.quality {
+                Quality::P1080 => 1080,
+                _ => 720,
+            };
+            let tracks = crate::youtube_parser::resolve(&self.song, max_height).await?;
+            log::info!(target: "DLNA1080", "YouTube 双轨就绪: generation={}, duration={}s", self.generation, tracks.duration_secs);
+            return self.prepare_dash(client, &tracks.video_url, &tracks.audio_url).await;
+        }
         if self.song.starts_with("http://") || self.song.starts_with("https://") {
             return Ok(SessionMedia::Direct(self.song.clone()));
         }
@@ -184,26 +193,7 @@ impl MediaSession {
                     video_url,
                     audio_url,
                     ..
-                } => {
-                    let prepared = tokio::time::timeout(
-                        Duration::from_secs(60),
-                        dash_index::prepare(client, &video_url, &audio_url),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "MP4 preparation timeout")
-                    })??;
-                    let cache = Arc::new(SongCache::new(
-                        &cache_root()?,
-                        client.clone(),
-                        prepared.sources,
-                        256 * 1024 * 1024,
-                    )?);
-                    Ok(SessionMedia::Seekable {
-                        mp4: Arc::new(prepared.mp4),
-                        cache,
-                    })
-                }
+                } => self.prepare_dash(client, &video_url, &audio_url).await,
             }
         }
         .await;
@@ -221,6 +211,30 @@ impl MediaSession {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn prepare_dash(
+        &self,
+        client: &reqwest::Client,
+        video_url: &str,
+        audio_url: &str,
+    ) -> io::Result<SessionMedia> {
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(60),
+            dash_index::prepare(client, video_url, audio_url),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MP4 preparation timeout"))??;
+        let cache = Arc::new(SongCache::new(
+            &cache_root()?,
+            client.clone(),
+            prepared.sources,
+            256 * 1024 * 1024,
+        )?);
+        Ok(SessionMedia::Seekable {
+            mp4: Arc::new(prepared.mp4),
+            cache,
+        })
     }
 }
 

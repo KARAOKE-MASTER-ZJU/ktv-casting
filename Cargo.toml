@@ -51,6 +51,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.10"
 md5 = "0.7"
+innertube-rs = "0.9.0"
 
 # CLI 专用依赖（仅非 Android target 可见）
 [target.'cfg(not(target_os = "android"))'.dependencies]

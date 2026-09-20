@@ -43,6 +43,8 @@ pub mod media_session;
 pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;
+pub mod youtube_parser;
+pub mod upstream;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
 

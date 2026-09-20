@@ -342,7 +342,7 @@ pub async fn fetch_range(
     let response = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://www.bilibili.com/")
+        .header("Referer", crate::upstream::referer(url))
         .header("Accept-Encoding", "identity")
         .header("Range", format!("bytes={}-{}", range.start, range.end - 1))
         .timeout(Duration::from_secs(10))

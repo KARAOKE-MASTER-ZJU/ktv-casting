@@ -52,7 +52,7 @@ impl BoxReader {
         let mut request = client
             .get(url)
             .header("User-Agent", "Mozilla/5.0")
-            .header("Referer", "https://www.bilibili.com/");
+            .header("Referer", crate::upstream::referer(url));
         if let Some(offset) = offset {
             request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
         }
