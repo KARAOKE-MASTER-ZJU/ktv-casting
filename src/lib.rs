@@ -38,6 +38,7 @@ pub mod fmp4_mux;
 pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;
+mod auto_next;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
 
@@ -79,6 +80,7 @@ pub struct EngineContext {
     pub local_ip: std::net::IpAddr,
     pub server_port: u16,
     pub is_playing: AtomicBool,
+    auto_next: Mutex<auto_next::AutoNextSong>,
     /// 仅 Bilibili 投屏使用：本地跟踪的弹幕/清晰度状态（设备侧没有读回接口）。
     // pub danmaku_on: AtomicBool,
     // pub quality_qn: AtomicU32,
@@ -132,10 +134,34 @@ pub async fn get_current_progress() -> (i32, i32) {
     };
     let Some(ctx) = ctx else { return (-1, -1) };
 
+    read_progress(&ctx).await
+}
+
+/// Poll progress and run the automatic end trigger. Manual next-song stays separate.
+pub async fn poll_playback_progress() -> (i32, i32) {
+    let ctx = ENGINE_STATE.read().ok().and_then(|guard| guard.as_ref().cloned());
+    let Some(ctx) = ctx else { return (-1, -1) };
+    // Serialize polling and snapshot the hash before querying the device. A slow
+    // progress query must not pick up a newer hash when it finishes.
+    let mut auto_next = ctx.auto_next.lock().await;
+    let hash = ctx.playlist_manager.current_hash().await;
+    let (current, total) = read_progress(&ctx).await;
+    if auto_next.observe(current, total) {
+        info!("歌曲即将结束，启动一次自动切歌任务");
+        auto_next.start_request(ctx.playlist_manager.clone(), hash, ctx.rt.handle());
+    }
+    (current, total)
+}
+
+async fn read_progress(ctx: &EngineContext) -> (i32, i32) {
+    let playing = ctx.playlist_manager.get_song_playing().await;
+    let cached_total = match playing.as_ref() {
+        Some(song) => *ctx.duration_cache.lock().await.get(song).unwrap_or(&0),
+        None => 0,
+    };
+
     match ctx.caster.get_progress().await {
         Ok(p) => {
-            let cached_total = get_total_duration().await;
-            let playing = ctx.playlist_manager.get_song_playing().await;
             debug!(
                 "progress: curr={} device_total={} cached_total={} playing={:?}",
                 p.current_secs, p.total_secs, cached_total, playing
@@ -360,6 +386,7 @@ pub async fn connect_room(
         local_ip: local_ip_addr,
         server_port: port,
         is_playing: AtomicBool::new(true),
+        auto_next: Mutex::new(auto_next::AutoNextSong::default()),
         // danmaku_on: AtomicBool::new(false),
         // quality_qn: AtomicU32::new(cast::Quality::default().as_qn()),
         rt,

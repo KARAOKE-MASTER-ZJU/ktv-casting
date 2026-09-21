@@ -25,6 +25,20 @@ pub struct PlaylistManager {
     sung_count: Arc<Mutex<usize>>,
 }
 
+#[derive(Debug)]
+pub(crate) enum SwitchSongError {
+    Retryable(String),
+    Rejected(String),
+}
+
+impl std::fmt::Display for SwitchSongError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Rejected(message) => f.write_str(message),
+        }
+    }
+}
+
 impl PlaylistManager {
     pub fn new(url: &str, room_id: String) -> Self {
         // 在初始化时构建一次 Client
@@ -411,28 +425,41 @@ impl PlaylistManager {
     }
 
     pub async fn switch_song(&mut self, next: bool) -> Result<(), String> {
+        let hash = self.current_hash().await;
+        self.switch_song_with_hash(next, &hash).await.map_err(|e| e.to_string())
+    }
+
+    pub(crate) async fn current_hash(&self) -> String {
+        self.hash.lock().await.clone().unwrap_or_else(|| "EMPTY_LIST_HASH".into())
+    }
+
+    pub(crate) async fn switch_song_with_hash(
+        &self,
+        next: bool,
+        hash: &str,
+    ) -> Result<(), SwitchSongError> {
         let url = format!("{}/api/{}Song?roomId={}", self.url, if next {"next"} else {"prev"}, self.room_id);
-        let temp_hash = self
-            .hash
-            .lock()
-            .await
-            .as_deref()
-            .unwrap_or("EMPTY_LIST_HASH")
-            .to_string();
         let resp = self
             .client
             .post(&url)
-            .json(&json!({"idArrayHash": temp_hash}))
+            .json(&json!({"idArrayHash": hash}))
             .send()
             .await
-            .map_err(|e| format!("发送请求失败: {}", e))?;
+            .map_err(|e| SwitchSongError::Retryable(format!("发送请求失败: {}", e)))?;
+        let status = resp.status();
+        if status.is_server_error() || status.as_u16() == 408 || status.as_u16() == 429 {
+            return Err(SwitchSongError::Retryable(format!("请求失败: HTTP {}", status)));
+        }
+        if !status.is_success() {
+            return Err(SwitchSongError::Rejected(format!("请求失败: HTTP {}", status)));
+        }
         let resp_json: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("解析JSON失败: {}", e))?;
+            .map_err(|e| SwitchSongError::Retryable(format!("解析JSON失败: {}", e)))?;
 
         if !resp_json["success"].as_bool().unwrap_or(false) {
-            return Err(format!("请求失败: {}", resp_json));
+            return Err(SwitchSongError::Rejected(format!("请求失败: {}", resp_json)));
         }
 
         Ok(())
@@ -452,6 +479,140 @@ impl PlaylistManager {
 
     pub async fn get_sung_count(&self) -> usize {
         *self.sung_count.lock().await
+    }
+}
+
+#[cfg(test)]
+mod automatic_next_tests {
+    use super::*;
+    use crate::auto_next::AutoNextSong;
+    use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    // Local-only server. None drops the response to simulate a lost reply after
+    // the server may already have advanced the playlist.
+    async fn server(
+        replies: Vec<Option<(u16, serde_json::Value)>>,
+    ) -> (PlaylistManager, mpsc::UnboundedReceiver<serde_json::Value>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = PlaylistManager::new(&format!("http://{}", listener.local_addr().unwrap()), "test".into());
+        *manager.hash.lock().await = Some("H0".into());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut replies: VecDeque<_> = replies.into();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let body_start = loop {
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let header = String::from_utf8_lossy(&bytes[..body_start]);
+                assert!(header.starts_with("POST /api/nextSong?roomId=test "));
+                let length: usize = header.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                }).unwrap();
+                while bytes.len() < body_start + length {
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                tx.send(serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap()).unwrap();
+                if let Some((status, body)) = replies.pop_front().unwrap_or(Some((200, json!({"success":true})))) {
+                    let body = body.to_string();
+                    stream.write_all(format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                    ).as_bytes()).await.unwrap();
+                }
+            }
+        });
+        (manager, rx, task)
+    }
+
+    async fn request(rx: &mut mpsc::UnboundedReceiver<serde_json::Value>) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap()
+    }
+
+    async fn no_more_requests(rx: &mut mpsc::UnboundedReceiver<serde_json::Value>) {
+        assert!(tokio::time::timeout(Duration::from_millis(1200), rx.recv()).await.is_err());
+    }
+
+    async fn poll(trigger: &mut AutoNextSong, manager: &PlaylistManager, current: i32, total: i32) {
+        let hash = manager.current_hash().await;
+        if trigger.observe(current, total) {
+            trigger.start_request(manager.clone(), hash, &tokio::runtime::Handle::current());
+        }
+    }
+
+    #[tokio::test]
+    async fn new_hash_and_old_progress_do_not_post_again_until_rewind() {
+        let (manager, mut requests, server) = server(vec![]).await;
+        let mut trigger = AutoNextSong::default();
+        poll(&mut trigger, &manager, 298, 300).await;
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H0");
+        *manager.hash.lock().await = Some("H1".into());
+        for _ in 0..5 {
+            poll(&mut trigger, &manager, 300, 180).await;
+        }
+        no_more_requests(&mut requests).await;
+        poll(&mut trigger, &manager, 1, 180).await;
+        poll(&mut trigger, &manager, 178, 180).await;
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H1");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_original_hash_without_more_progress_polls() {
+        let (mut manager, mut requests, server) = server(vec![
+            Some((503, json!({"error":"temporarily unavailable"}))),
+            Some((200, json!({"success":true}))),
+        ]).await;
+        let mut trigger = AutoNextSong::default();
+        poll(&mut trigger, &manager, 298, 300).await;
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H0");
+        *manager.hash.lock().await = Some("H1".into());
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H0");
+        no_more_requests(&mut requests).await;
+        // Manual next is still independent and uses the latest playlist hash.
+        manager.next_song().await.unwrap();
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H1");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lost_response_then_reject_stops_without_switching_to_new_hash() {
+        let (manager, mut requests, server) = server(vec![
+            None,
+            Some((200, json!({"success":false,"code":"REJECT"}))),
+        ]).await;
+        let mut trigger = AutoNextSong::default();
+        poll(&mut trigger, &manager, 298, 300).await;
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H0");
+        *manager.hash.lock().await = Some("H1".into());
+        assert_eq!(request(&mut requests).await["idArrayHash"], "H0");
+        no_more_requests(&mut requests).await;
+        poll(&mut trigger, &manager, 300, 300).await;
+        no_more_requests(&mut requests).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_trigger_cancels_pending_retries() {
+        let (manager, mut requests, server) = server(vec![Some((503, json!({}))) ]).await;
+        let mut trigger = AutoNextSong::default();
+        poll(&mut trigger, &manager, 298, 300).await;
+        request(&mut requests).await;
+        drop(trigger);
+        no_more_requests(&mut requests).await;
+        server.abort();
     }
 }
 

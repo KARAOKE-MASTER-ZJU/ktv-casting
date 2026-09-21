@@ -362,38 +362,12 @@ mod cli {
                 guard.as_ref().cloned()
             };
 
-            let Some(ctx) = ctx else { break };
+            if ctx.is_none() { break; }
 
-            if let Ok(p) = ctx.caster.get_progress().await {
-                let curr_u64 = p.current_secs as u64;
-
-                // Prefer cached total (set by DLNA media server); fall back to
-                // the value from the caster itself (set by BilibiliCaster via LocalProgressTracker).
-                let total_u64 = {
-                    let cached = if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
-                        *ctx.duration_cache.lock().await.get(&playing).unwrap_or(&0)
-                    } else {
-                        0
-                    };
-                    if cached > 0 { cached as u64 } else { p.total_secs as u64 }
-                };
-
-                if total_u64 > 0 {
-                    set_len(total_u64);
-                    set_pos(curr_u64);
-
-                    if curr_u64 > 5
-                        && total_u64 > curr_u64
-                        && (total_u64 - curr_u64) <= 2
-                    {
-                        info!(">> 歌曲即将结束，自动切换下一首...");
-                        let mut pm = ctx.playlist_manager.clone();
-                        if let Err(e) = pm.next_song().await {
-                            warn!("自动切歌失败: {}", e);
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                }
+            let (current, total) = ktv_casting_lib::poll_playback_progress().await;
+            if current >= 0 && total > 0 {
+                set_len(total as u64);
+                set_pos(current as u64);
             }
         }
         Ok(())
