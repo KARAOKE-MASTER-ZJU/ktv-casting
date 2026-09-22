@@ -261,6 +261,23 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_queryProgress(
     result_array.into_raw()
 }
 
+// 自动轮询使用独立入口，避免将手动 nextSong 也限制为 once。
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_pollPlaybackProgress(
+    env: JNIEnv,
+    _class: JClass,
+) -> jintArray {
+    let ctx = ENGINE_STATE.read().ok().and_then(|guard| guard.as_ref().cloned());
+    let (current, total) = match ctx {
+        Some(ctx) => ctx.rt.block_on(crate::poll_playback_progress()),
+        None => (-1, -1),
+    };
+    let result = env.new_int_array(2).expect("无法创建 Java 数组");
+    env.set_int_array_region(&result, 0, &[current, total]).expect("无法填充数组数据");
+    result.into_raw()
+}
+
 // 7a. 控制接口：切歌(下一首)
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
