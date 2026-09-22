@@ -318,3 +318,89 @@ async fn dropping_playback_state_cancels_its_retry_without_an_ownership_cycle() 
     no_more_requests(&mut requests).await;
     server.abort();
 }
+
+#[tokio::test]
+async fn heartbeat_sync_plays_missed_song_and_later_updates_do_not_replay_it() {
+    let (manager, mut requests, server) = server(vec![
+        Some((200, playlist("H0", "A", "BV-A"))),
+        Some((200, playlist("H1", "B", "BV-B"))),
+        Some((200, json!({"changed":false}))),
+        Some((200, playlist("H2", "B", "BV-B"))),
+    ])
+    .await;
+    let (played, mut received) = mpsc::unbounded_channel();
+    let mut callback = |url| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let manager = manager.clone();
+        let played = played.clone();
+        Box::pin(async move {
+            // Song sync must mask the old renderer position before dispatching play.
+            assert_eq!(progress(&manager, 298, 300).await, (-1, -1));
+            confirm_play(&manager, false).await;
+            played.send(url).unwrap();
+        })
+    };
+    let mut cached = None;
+    manager
+        .sync_playlist(&mut cached, &mut callback)
+        .await
+        .unwrap();
+    assert_eq!(received.try_recv().unwrap(), "BV-A");
+    // No WS notification: the heartbeat uses this same operation and must play B.
+    manager
+        .sync_playlist(&mut cached, &mut callback)
+        .await
+        .unwrap();
+    assert_eq!(received.try_recv().unwrap(), "BV-B");
+    assert_eq!(progress(&manager, 1, 180).await, (1, 180));
+    // A later sync/reconnect and a queue-only update must not replay B.
+    for _ in 0..2 {
+        manager
+            .sync_playlist(&mut cached, &mut callback)
+            .await
+            .unwrap();
+    }
+    assert!(received.try_recv().is_err());
+    assert_eq!(manager.current_hash().await, "H2");
+    for _ in 0..4 {
+        request(&mut requests).await;
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_sync_preserves_handled_song_and_next_sync_recovers() {
+    let (manager, mut requests, server) = server(vec![
+        Some((200, playlist("H0", "A", "BV-A"))),
+        Some((503, json!({}))),
+        Some((200, playlist("H1", "B", "BV-B"))),
+    ])
+    .await;
+    let (played, mut received) = mpsc::unbounded_channel();
+    let mut callback = |url| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        played.send(url).unwrap();
+        Box::pin(async {})
+    };
+    let mut cached = None;
+    manager
+        .sync_playlist(&mut cached, &mut callback)
+        .await
+        .unwrap();
+    assert_eq!(received.try_recv().unwrap(), "BV-A");
+    assert!(
+        manager
+            .sync_playlist(&mut cached, &mut callback)
+            .await
+            .is_err()
+    );
+    assert_eq!(cached, Some((Some("A".into()), "BV-A".into())));
+    assert!(received.try_recv().is_err());
+    manager
+        .sync_playlist(&mut cached, &mut callback)
+        .await
+        .unwrap();
+    assert_eq!(received.try_recv().unwrap(), "BV-B");
+    for _ in 0..3 {
+        request(&mut requests).await;
+    }
+    server.abort();
+}

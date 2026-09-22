@@ -168,7 +168,25 @@ impl PlaylistManager {
         }
     }
 
-    fn start_ws_update<F>(&self, f_on_update: F)
+    async fn sync_playlist<F>(
+        &self,
+        song_playing_cached: &mut Option<(Option<String>, String)>,
+        f_on_update: &mut F,
+    ) -> Result<(), String>
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send,
+    {
+        let song = self.fetch_playlist().await?;
+        if song != *song_playing_cached {
+            if let Some((_, url)) = &song {
+                f_on_update(url.clone()).await;
+            }
+            *song_playing_cached = song;
+        }
+        Ok(())
+    }
+
+    fn start_ws_update<F>(&self, mut f_on_update: F)
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
@@ -183,6 +201,8 @@ impl PlaylistManager {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
             info!("心跳间隔: {} 秒", interval_secs);
+            // Keep the last handled song across reconnects as well as heartbeat/WS updates.
+            let mut song_playing_cached = None;
             loop {
                 // 构造 WS URL （将 http(s) -> ws(s)）
                 let nickname = env::var("KTV_NICKNAME").unwrap_or_default();
@@ -306,22 +326,8 @@ impl PlaylistManager {
 
                 info!("WebSocket connected for room {}", self_clone.room_id);
 
-                // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
-                let mut song_playing_cached =
-                    self_clone.progress_gate.lock().await.song();
-                match self_clone.fetch_playlist().await {
-                    Ok(Some(song)) => {
-                        if Some(song.clone()) != song_playing_cached {
-                            let url = song.1.clone();
-                            info!("检测到新歌曲，初始化投屏: {}", url);
-                            f_on_update(url.clone()).await;
-                            song_playing_cached = Some(song);
-                        } else {
-                            info!("重连成功，歌曲未变，跳过重复投屏");
-                        }
-                    }
-                    Ok(None) => debug!("歌单目前为空，等待点歌..."),
-                    Err(e) => error!("初始化拉取失败: {}", e),
+                if let Err(e) = self_clone.sync_playlist(&mut song_playing_cached, &mut f_on_update).await {
+                    error!("初始化拉取失败: {}", e);
                 }
                 let (mut write, mut read) = ws_stream.split();
 
@@ -342,16 +348,11 @@ impl PlaylistManager {
                                 break;
                             }
 
-                            // Keep-Alive HTTP Connection Pool
-                            let pm_warm = self_clone.clone();
-                            tokio::spawn(async move {
-                                // 调用 fetch_playlist 会执行一次完整的 HTTP GET 请求
-                                // 从而让 reqwest 保持与后端的 TCP 连接处于活跃状态
-                                match pm_warm.fetch_playlist().await {
-                                    Ok(_) => debug!("HTTP Keep-Alive"),
-                                    Err(e) => debug!("HTTP Keep-Alive Failed: {}", e),
-                                }
-                            });
+                            // Reuse HTTP connections and recover missed WS updates through
+                            // the same serial sync path, including device playback.
+                            if let Err(e) = self_clone.sync_playlist(&mut song_playing_cached, &mut f_on_update).await {
+                                debug!("心跳同步歌单失败: {}", e);
+                            }
                         }
 
                         // 分支 B：接收 WS 消息
@@ -375,13 +376,8 @@ impl PlaylistManager {
                                     if incoming_hash == current_hash { continue; }
 
                                     debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
-                                    if let Ok(song_playing_new) = self_clone.fetch_playlist().await {
-                                        if song_playing_new != song_playing_cached {
-                                            if let Some((_, url)) = song_playing_new.clone() {
-                                                f_on_update(url).await;
-                                            }
-                                            song_playing_cached = song_playing_new;
-                                        }
+                                    if let Err(e) = self_clone.sync_playlist(&mut song_playing_cached, &mut f_on_update).await {
+                                        error!("WS 同步歌单失败: {}", e);
                                     }
                                 }
                                 Message::Ping(p) => {
@@ -401,7 +397,7 @@ impl PlaylistManager {
         });
     }
 
-    pub fn start_periodic_update<F>(&self, f_on_update: F)
+    pub fn start_periodic_update<F>(&self, mut f_on_update: F)
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
@@ -411,16 +407,8 @@ impl PlaylistManager {
             let mut song_playing = None;
             loop {
                 interval.tick().await;
-                match self_clone.fetch_playlist().await {
-                    Err(e) => error!("定时更新播放列表失败: {}", e),
-                    Ok(song_playing_new) => {
-                        if song_playing_new != song_playing {
-                            if let Some((_, url)) = song_playing_new.clone() {
-                                f_on_update(url).await; // await the future
-                            }
-                            song_playing = song_playing_new;
-                        }
-                    }
+                if let Err(e) = self_clone.sync_playlist(&mut song_playing, &mut f_on_update).await {
+                    error!("定时更新播放列表失败: {}", e);
                 }
             }
         });
