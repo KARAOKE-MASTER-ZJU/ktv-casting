@@ -39,6 +39,10 @@ pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;
 mod auto_next;
+mod progress_gate;
+#[cfg(test)]
+#[path = "../test/playback.rs"]
+mod playback_tests;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
 
@@ -80,7 +84,6 @@ pub struct EngineContext {
     pub local_ip: std::net::IpAddr,
     pub server_port: u16,
     pub is_playing: AtomicBool,
-    auto_next: Mutex<auto_next::AutoNextSong>,
     /// 仅 Bilibili 投屏使用：本地跟踪的弹幕/清晰度状态（设备侧没有读回接口）。
     // pub danmaku_on: AtomicBool,
     // pub quality_qn: AtomicU32,
@@ -134,33 +137,28 @@ pub async fn get_current_progress() -> (i32, i32) {
     };
     let Some(ctx) = ctx else { return (-1, -1) };
 
-    read_progress(&ctx).await
+    read_progress(&ctx, false).await
 }
 
 /// Poll progress and run the automatic end trigger. Manual next-song stays separate.
 pub async fn poll_playback_progress() -> (i32, i32) {
     let ctx = ENGINE_STATE.read().ok().and_then(|guard| guard.as_ref().cloned());
     let Some(ctx) = ctx else { return (-1, -1) };
-    // Serialize polling and snapshot the hash before querying the device. A slow
-    // progress query must not pick up a newer hash when it finishes.
-    let mut auto_next = ctx.auto_next.lock().await;
-    let hash = ctx.playlist_manager.current_hash().await;
-    let (current, total) = read_progress(&ctx).await;
-    if auto_next.observe(current, total) {
-        info!("歌曲即将结束，启动一次自动切歌任务");
-        auto_next.start_request(ctx.playlist_manager.clone(), hash, ctx.rt.handle());
-    }
-    (current, total)
+    read_progress(&ctx, true).await
 }
 
-async fn read_progress(ctx: &EngineContext) -> (i32, i32) {
+async fn read_progress(ctx: &EngineContext, trigger_next: bool) -> (i32, i32) {
+    let gate = ctx.playlist_manager.progress_gate.lock().await;
+    let revision = gate.revision();
+    let hash = ctx.playlist_manager.current_hash().await;
     let playing = ctx.playlist_manager.get_song_playing().await;
     let cached_total = match playing.as_ref() {
         Some(song) => *ctx.duration_cache.lock().await.get(song).unwrap_or(&0),
         None => 0,
     };
+    drop(gate);
 
-    match ctx.caster.get_progress().await {
+    let (current, total) = match ctx.caster.get_progress().await {
         Ok(p) => {
             debug!(
                 "progress: curr={} device_total={} cached_total={} playing={:?}",
@@ -170,7 +168,16 @@ async fn read_progress(ctx: &EngineContext) -> (i32, i32) {
             (p.current_secs as i32, total)
         }
         Err(_) => (-1, -1),
+    };
+    let mut gate = ctx.playlist_manager.progress_gate.lock().await;
+    let (current, total) = gate.filter(revision, current, total);
+    // Validate the sample and consume once under the same lock as song updates
+    // and play confirmations. An old poll cannot trigger after a new playback.
+    if trigger_next && gate.auto_next.observe(current, total) {
+        info!("歌曲即将结束，启动一次自动切歌任务");
+        gate.auto_next.start_request(ctx.playlist_manager.clone(), hash, ctx.rt.handle());
     }
+    (current, total)
 }
 
 pub fn trigger_next_song() {
@@ -356,10 +363,13 @@ pub async fn connect_room(
 
     let caster_cb = Arc::clone(&caster);
     let cache_cb = Arc::clone(&cache);
+    let gate_cb = Arc::clone(&pm.progress_gate);
     pm.start_sync(move |video_url| {
         let c = Arc::clone(&caster_cb);
         let cache = Arc::clone(&cache_cb);
+        let gate = Arc::clone(&gate_cb);
         Box::pin(async move {
+            let Some(token) = gate.lock().await.play_token(&video_url) else { return };
             info!("通知设备准备拉取路径: {}", video_url);
             // 先写入 BV 的完整时长，再通知 DLNA 设备拉流。DASH/fMP4 的 moov
             // 可能只给 renderer 暴露首个分片（约 5 秒）的临时时长；若先播放，
@@ -373,9 +383,7 @@ pub async fn connect_room(
                 }
             }
 
-            if let Err(e) = c.play_song(&cast::SongRef(video_url.clone())).await {
-                warn!("自动切歌失败: {}", e);
-            }
+            play_and_confirm(&*c, &video_url, token, &gate).await;
         })
     });
 
@@ -386,7 +394,6 @@ pub async fn connect_room(
         local_ip: local_ip_addr,
         server_port: port,
         is_playing: AtomicBool::new(true),
-        auto_next: Mutex::new(auto_next::AutoNextSong::default()),
         // danmaku_on: AtomicBool::new(false),
         // quality_qn: AtomicU32::new(cast::Quality::default().as_qn()),
         rt,
@@ -398,6 +405,23 @@ pub async fn connect_room(
     }
 
     Ok(())
+}
+
+async fn play_and_confirm(
+    caster: &dyn cast::Caster,
+    song: &str,
+    token: u64,
+    gate: &Mutex<progress_gate::ProgressGate>,
+) {
+    if gate.lock().await.revision() != token { return; }
+    match caster.play_song(&cast::SongRef(song.to_owned())).await {
+        Ok(()) => {
+            gate.lock().await.play_succeeded(
+                token, caster.capabilities().hardware_progress, std::time::Instant::now(),
+            );
+        }
+        Err(error) => warn!("自动切歌失败: {}", error),
+    }
 }
 
 fn extract_bvid(video_url: &str) -> Option<(String,u32)> {

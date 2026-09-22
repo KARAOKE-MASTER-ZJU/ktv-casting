@@ -368,6 +368,10 @@ mod cli {
             if current >= 0 && total > 0 {
                 set_len(total as u64);
                 set_pos(current as u64);
+            } else {
+                // Hide stale progress while the renderer is changing songs.
+                set_pos(0);
+                set_len(0);
             }
         }
         Ok(())
