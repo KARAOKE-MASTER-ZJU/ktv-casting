@@ -8,6 +8,7 @@ struct TestCaster {
     fail: bool,
     started: Notify,
     reply: Notify,
+    songs: Mutex<Vec<String>>,
 }
 
 impl TestCaster {
@@ -18,13 +19,15 @@ impl TestCaster {
             fail,
             started: Notify::new(),
             reply: Notify::new(),
+            songs: Mutex::new(Vec::new()),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl Caster for TestCaster {
-    async fn play_song(&self, _: &SongRef) -> Result<(), CastError> {
+    async fn play_song(&self, song: &SongRef) -> Result<(), CastError> {
+        self.songs.lock().await.push(song.0.clone());
         self.started.notify_one();
         self.reply.notified().await;
         if self.fail {
@@ -61,6 +64,90 @@ impl Caster for TestCaster {
             absolute_volume: false,
         }
     }
+}
+
+#[tokio::test]
+async fn failed_initial_cast_can_retry_the_same_song_without_reconnecting() {
+    let mut caster = TestCaster::new(false, true);
+    let gate = setup(240).await;
+    let token = gate.lock().await.play_token("B").unwrap();
+    caster.reply.notify_one();
+    assert!(!play_and_confirm(&caster, "B", token, &gate).await);
+    caster.fail = false;
+    caster.reply.notify_one();
+    let result = recast_with_caster(
+        &caster, &gate, &Mutex::new(Default::default()), &Mutex::new(()),
+    ).await;
+    assert_eq!(result, 1);
+    assert_eq!(*caster.songs.lock().await, ["B", "B"]);
+    let mut state = gate.lock().await;
+    assert_eq!(state.song(), Some((Some("B".into()), "B".into())));
+    let revision = state.revision();
+    assert_eq!(state.filter(revision, 0, 180), (0, 180));
+    assert!(state.auto_next.observe(178, 180));
+}
+
+#[tokio::test]
+async fn recast_rejects_duplicates_and_masks_old_end_progress() {
+    let caster = TestCaster::new(false, false);
+    let gate = setup(240).await;
+    let cache = Mutex::new(Default::default());
+    let playback = Mutex::new(());
+    let (result, ()) = tokio::join!(
+        recast_with_caster(&caster, &gate, &cache, &playback),
+        async {
+            caster.started.notified().await;
+            assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, -2);
+            let mut state = gate.lock().await;
+            let revision = state.revision();
+            let (current, total) = state.filter(revision, 298, 300);
+            assert_eq!((current, total), (-1, -1));
+            assert!(!state.auto_next.observe(current, total));
+            drop(state);
+            caster.reply.notify_one();
+        },
+    );
+    assert_eq!(result, 1);
+    assert_eq!(*caster.songs.lock().await, ["B"]);
+}
+
+#[tokio::test]
+async fn recast_failure_releases_busy_state_for_another_attempt() {
+    let mut caster = TestCaster::new(true, true);
+    let gate = setup(240).await;
+    let cache = Mutex::new(Default::default());
+    let playback = Mutex::new(());
+    caster.reply.notify_one();
+    assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, -1);
+    caster.fail = false;
+    caster.reply.notify_one();
+    assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, 1);
+    let mut state = gate.lock().await;
+    let revision = state.revision();
+    assert_eq!(state.filter(revision, 298, 180), (0, 180));
+    let revision = state.revision();
+    assert_eq!(state.filter(revision, 0, 180), (0, 180));
+}
+
+#[tokio::test]
+async fn missing_current_song_does_not_send_a_play_command() {
+    let caster = TestCaster::new(false, false);
+    assert_eq!(recast_with_caster(
+        &caster, &Mutex::new(Default::default()),
+        &Mutex::new(Default::default()), &Mutex::new(()),
+    ).await, 0);
+    assert!(caster.songs.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn recast_timeout_releases_busy_state_for_another_attempt() {
+    let caster = TestCaster::new(false, false);
+    let gate = setup(240).await;
+    let cache = Mutex::new(Default::default());
+    let playback = Mutex::new(());
+    assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, -1);
+    caster.reply.notify_one();
+    assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, 1);
 }
 
 async fn setup(current: i32) -> Mutex<progress_gate::ProgressGate> {

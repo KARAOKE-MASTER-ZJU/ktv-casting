@@ -82,6 +82,9 @@ cargo build --release
 ### Android ABI
 
 ```bash
+# 安装 cargo-ndk 插件
+cargo install cargo-ndk
+
 rustup target add aarch64-linux-android
 cargo ndk -t arm64-v8a build --lib --release
 ```

@@ -50,6 +50,18 @@ impl ProgressGate {
             .map(|_| self.revision)
     }
 
+    pub(crate) fn begin_recast(&mut self) -> Option<(String, u64)> {
+        let (_, url) = self.song.as_ref()?;
+        let url = url.clone();
+        if !matches!(self.phase, Phase::AwaitingCommand) {
+            self.baseline = self.last_current;
+        }
+        self.phase = Phase::AwaitingCommand;
+        self.revision += 1;
+        self.auto_next.cancel_pending_request();
+        Some((url, self.revision))
+    }
+
     pub(crate) fn play_succeeded(
         &mut self,
         token: u64,

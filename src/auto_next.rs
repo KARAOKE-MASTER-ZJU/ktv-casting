@@ -14,6 +14,10 @@ pub(crate) struct AutoNextSong {
 impl AutoNextSong {
     pub(crate) fn reset_for_playback(&mut self) {
         self.fired = false;
+        self.cancel_pending_request();
+    }
+
+    pub(crate) fn cancel_pending_request(&mut self) {
         if let Some(task) = self.retry_task.take() {
             task.abort();
         }

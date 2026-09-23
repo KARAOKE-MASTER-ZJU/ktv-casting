@@ -291,6 +291,20 @@ pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_prevSong(_env: JNIEn
     crate::trigger_prev_song();
 }
 
+/// Called from Kotlin's IO dispatcher; no engine initialization or playlist mutation.
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_zju_bangdream_ktv_casting_RustEngine_recastCurrentSong(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    let ctx = ENGINE_STATE.read().ok().and_then(|guard| guard.as_ref().cloned());
+    match ctx {
+        Some(ctx) => ctx.rt.block_on(crate::recast_current_song(&ctx)),
+        None => 0,
+    }
+}
+
 // 8. 控制接口：播放/暂停 切换
 // 返回 1 表示播放，0 表示暂停，失败返回 -1
 #[allow(non_snake_case)]
