@@ -448,10 +448,6 @@ impl Caster for BilibiliCaster {
         })?;
         log::info!("[Bilibili] get_page_info: page={} -> cid={}, duration={}", page, cid, duration);
 
-        if duration > 0 {
-            self.progress.start(duration).await;
-        }
-
         // 获取 quality 读锁并拿到枚举，然后转为 qn 数值
         let current_quality = self.quality.load(Ordering::Relaxed);
         // 读取 AtomicBool 的当前值
@@ -462,6 +458,9 @@ impl Caster for BilibiliCaster {
 
         log::info!("[Bilibili] sending play command: aid={}, cid={}, page={}, extra={}", aid, cid, page, extra);
         self.send_cmd(1, aid, Some(extra), 0).await?;
+        // The cloud API response is our only playback acknowledgement. Start the
+        // simulated clock only after success, including clearing stale duration.
+        self.progress.start(duration).await;
 
         // 已保存状态，无需再次设置
         // 每次开始投屏都重置为默认状态：弹幕关闭、清晰度 1080P。

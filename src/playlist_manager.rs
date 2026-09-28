@@ -23,6 +23,21 @@ pub struct PlaylistManager {
     song_title: Arc<Mutex<Option<String>>>,
     queued_count: Arc<Mutex<usize>>,
     sung_count: Arc<Mutex<usize>>,
+    pub(crate) progress_gate: Arc<Mutex<crate::progress_gate::ProgressGate>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SwitchSongError {
+    Retryable(String),
+    Rejected(String),
+}
+
+impl std::fmt::Display for SwitchSongError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Rejected(message) => f.write_str(message),
+        }
+    }
 }
 
 impl PlaylistManager {
@@ -42,6 +57,7 @@ impl PlaylistManager {
             song_title: Arc::new(Mutex::new(None)),
             queued_count: Arc::new(Mutex::new(0)),
             sung_count: Arc::new(Mutex::new(0)),
+            progress_gate: Arc::new(Mutex::new(crate::progress_gate::ProgressGate::default())),
         }
     }
 
@@ -52,7 +68,7 @@ impl PlaylistManager {
     //   hash: string
     // }
     // Song { id, title, url, addedBy? }
-    async fn fetch_playlist(&self) -> Result<Option<String>, String> {
+    async fn fetch_playlist(&self) -> Result<Option<(Option<String>, String)>, String> {
         let last_hash = self
             .hash
             .lock()
@@ -85,7 +101,7 @@ impl PlaylistManager {
 
         if !changed {
             debug!("播放列表未改变，跳过更新");
-            return Ok(self.song_playing.lock().await.clone());
+            return Ok(self.progress_gate.lock().await.song());
         }
 
         // 获取新的 hash 值
@@ -121,6 +137,12 @@ impl PlaylistManager {
         let queued_count = resp_json["list"]["queued"].as_array().map_or(0, Vec::len);
         let sung_count = resp_json["list"]["sung"].as_array().map_or(0, Vec::len);
 
+        // Mask old renderer progress before publishing the new song/hash. All
+        // sync paths (including heartbeat) apply this same guard.
+        let singing_id = resp_json["list"]["singing"]["id"]
+            .as_str().map(str::to_owned);
+        let mut gate = self.progress_gate.lock().await;
+        gate.update_song(singing_id, singing_url.clone());
         // 更新状态
         *self.song_playing.lock().await = singing_url.clone();
         *self.song_title.lock().await = singing_title; // 更新标题
@@ -128,7 +150,7 @@ impl PlaylistManager {
         *self.queued_count.lock().await = queued_count;
         *self.sung_count.lock().await = sung_count;
 
-        Ok(singing_url)
+        Ok(gate.song())
     }
 
     // 根据环境变量切换同步驱动（WS / POLLING）
@@ -146,7 +168,25 @@ impl PlaylistManager {
         }
     }
 
-    fn start_ws_update<F>(&self, f_on_update: F)
+    async fn sync_playlist<F>(
+        &self,
+        song_playing_cached: &mut Option<(Option<String>, String)>,
+        f_on_update: &mut F,
+    ) -> Result<(), String>
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send,
+    {
+        let song = self.fetch_playlist().await?;
+        if song != *song_playing_cached {
+            if let Some((_, url)) = &song {
+                f_on_update(url.clone()).await;
+            }
+            *song_playing_cached = song;
+        }
+        Ok(())
+    }
+
+    fn start_ws_update<F>(&self, mut f_on_update: F)
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
@@ -161,6 +201,8 @@ impl PlaylistManager {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
             info!("心跳间隔: {} 秒", interval_secs);
+            // Keep the last handled song across reconnects as well as heartbeat/WS updates.
+            let mut song_playing_cached = None;
             loop {
                 // 构造 WS URL （将 http(s) -> ws(s)）
                 let nickname = env::var("KTV_NICKNAME").unwrap_or_default();
@@ -284,21 +326,8 @@ impl PlaylistManager {
 
                 info!("WebSocket connected for room {}", self_clone.room_id);
 
-                // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
-                let mut song_playing_cached: Option<String> =
-                    self_clone.song_playing.lock().await.clone();
-                match self_clone.fetch_playlist().await {
-                    Ok(Some(url)) => {
-                        if Some(url.clone()) != song_playing_cached {
-                            info!("检测到新歌曲，初始化投屏: {}", url);
-                            f_on_update(url.clone()).await;
-                            song_playing_cached = Some(url);
-                        } else {
-                            info!("重连成功，歌曲未变，跳过重复投屏");
-                        }
-                    }
-                    Ok(None) => debug!("歌单目前为空，等待点歌..."),
-                    Err(e) => error!("初始化拉取失败: {}", e),
+                if let Err(e) = self_clone.sync_playlist(&mut song_playing_cached, &mut f_on_update).await {
+                    error!("初始化拉取失败: {}", e);
                 }
                 let (mut write, mut read) = ws_stream.split();
 
@@ -319,16 +348,11 @@ impl PlaylistManager {
                                 break;
                             }
 
-                            // Keep-Alive HTTP Connection Pool
-                            let pm_warm = self_clone.clone();
-                            tokio::spawn(async move {
-                                // 调用 fetch_playlist 会执行一次完整的 HTTP GET 请求
-                                // 从而让 reqwest 保持与后端的 TCP 连接处于活跃状态
-                                match pm_warm.fetch_playlist().await {
-                                    Ok(_) => debug!("HTTP Keep-Alive"),
-                                    Err(e) => debug!("HTTP Keep-Alive Failed: {}", e),
-                                }
-                            });
+                            // Reuse HTTP connections and recover missed WS updates through
+                            // the same serial sync path, including device playback.
+                            if let Err(e) = self_clone.sync_playlist(&mut song_playing_cached, &mut f_on_update).await {
+                                debug!("心跳同步歌单失败: {}", e);
+                            }
                         }
 
                         // 分支 B：接收 WS 消息
@@ -352,13 +376,8 @@ impl PlaylistManager {
                                     if incoming_hash == current_hash { continue; }
 
                                     debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
-                                    if let Ok(song_playing_new) = self_clone.fetch_playlist().await {
-                                        if song_playing_new != song_playing_cached {
-                                            if let Some(url) = song_playing_new.clone() {
-                                                f_on_update(url).await;
-                                            }
-                                            song_playing_cached = song_playing_new;
-                                        }
+                                    if let Err(e) = self_clone.sync_playlist(&mut song_playing_cached, &mut f_on_update).await {
+                                        error!("WS 同步歌单失败: {}", e);
                                     }
                                 }
                                 Message::Ping(p) => {
@@ -378,26 +397,18 @@ impl PlaylistManager {
         });
     }
 
-    pub fn start_periodic_update<F>(&self, f_on_update: F)
+    pub fn start_periodic_update<F>(&self, mut f_on_update: F)
     where
         F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
     {
         let self_clone = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
-            let mut song_playing: Option<String> = None;
+            let mut song_playing = None;
             loop {
                 interval.tick().await;
-                match self_clone.fetch_playlist().await {
-                    Err(e) => error!("定时更新播放列表失败: {}", e),
-                    Ok(song_playing_new) => {
-                        if song_playing_new != song_playing {
-                            if let Some(url) = song_playing_new.clone() {
-                                f_on_update(url).await; // await the future
-                            }
-                            song_playing = song_playing_new;
-                        }
-                    }
+                if let Err(e) = self_clone.sync_playlist(&mut song_playing, &mut f_on_update).await {
+                    error!("定时更新播放列表失败: {}", e);
                 }
             }
         });
@@ -411,28 +422,46 @@ impl PlaylistManager {
     }
 
     pub async fn switch_song(&mut self, next: bool) -> Result<(), String> {
+        let hash = self.current_hash().await;
+        self.switch_song_with_hash(next, &hash).await.map_err(|e| e.to_string())
+    }
+
+    pub(crate) async fn current_hash(&self) -> String {
+        self.hash.lock().await.clone().unwrap_or_else(|| "EMPTY_LIST_HASH".into())
+    }
+
+    pub(crate) async fn switch_song_with_hash(
+        &self,
+        next: bool,
+        hash: &str,
+    ) -> Result<(), SwitchSongError> {
+        Self::send_switch_request(self.switch_request(next, hash)).await
+    }
+
+    pub(crate) fn switch_request(&self, next: bool, hash: &str) -> reqwest::RequestBuilder {
         let url = format!("{}/api/{}Song?roomId={}", self.url, if next {"next"} else {"prev"}, self.room_id);
-        let temp_hash = self
-            .hash
-            .lock()
-            .await
-            .as_deref()
-            .unwrap_or("EMPTY_LIST_HASH")
-            .to_string();
-        let resp = self
-            .client
-            .post(&url)
-            .json(&json!({"idArrayHash": temp_hash}))
+        self.client.post(url).json(&json!({"idArrayHash": hash}))
+    }
+
+    pub(crate) async fn send_switch_request(request: reqwest::RequestBuilder) -> Result<(), SwitchSongError> {
+        let resp = request
             .send()
             .await
-            .map_err(|e| format!("发送请求失败: {}", e))?;
+            .map_err(|e| SwitchSongError::Retryable(format!("发送请求失败: {}", e)))?;
+        let status = resp.status();
+        if status.is_server_error() || status.as_u16() == 408 || status.as_u16() == 429 {
+            return Err(SwitchSongError::Retryable(format!("请求失败: HTTP {}", status)));
+        }
+        if !status.is_success() {
+            return Err(SwitchSongError::Rejected(format!("请求失败: HTTP {}", status)));
+        }
         let resp_json: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("解析JSON失败: {}", e))?;
+            .map_err(|e| SwitchSongError::Retryable(format!("解析JSON失败: {}", e)))?;
 
         if !resp_json["success"].as_bool().unwrap_or(false) {
-            return Err(format!("请求失败: {}", resp_json));
+            return Err(SwitchSongError::Rejected(format!("请求失败: {}", resp_json)));
         }
 
         Ok(())
@@ -454,6 +483,10 @@ impl PlaylistManager {
         *self.sung_count.lock().await
     }
 }
+
+#[cfg(test)]
+#[path = "../test/playlist_manager.rs"]
+mod automatic_next_tests;
 
 #[tokio::test]
 async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {

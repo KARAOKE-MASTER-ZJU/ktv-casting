@@ -45,6 +45,11 @@ pub mod mp4_util;
 pub mod playlist_manager;
 pub mod youtube_parser;
 pub mod upstream;
+mod auto_next;
+mod progress_gate;
+#[cfg(test)]
+#[path = "../test/playback.rs"]
+mod playback_tests;
 
 pub static ENGINE_STATE: RwLock<Option<Arc<EngineContext>>> = RwLock::new(None);
 
@@ -86,6 +91,7 @@ pub struct EngineContext {
     pub local_ip: std::net::IpAddr,
     pub server_port: u16,
     pub is_playing: AtomicBool,
+    playback_lock: Arc<Mutex<()>>,
     /// 仅 Bilibili 投屏使用：本地跟踪的弹幕/清晰度状态（设备侧没有读回接口）。
     // pub danmaku_on: AtomicBool,
     // pub quality_qn: AtomicU32,
@@ -140,10 +146,29 @@ pub async fn get_current_progress() -> (i32, i32) {
     };
     let Some(ctx) = ctx else { return (-1, -1) };
 
-    match ctx.caster.get_progress().await {
+    read_progress(&ctx, false).await
+}
+
+/// Poll progress and run the automatic end trigger. Manual next-song stays separate.
+pub async fn poll_playback_progress() -> (i32, i32) {
+    let ctx = ENGINE_STATE.read().ok().and_then(|guard| guard.as_ref().cloned());
+    let Some(ctx) = ctx else { return (-1, -1) };
+    read_progress(&ctx, true).await
+}
+
+async fn read_progress(ctx: &EngineContext, trigger_next: bool) -> (i32, i32) {
+    let gate = ctx.playlist_manager.progress_gate.lock().await;
+    let revision = gate.revision();
+    let hash = ctx.playlist_manager.current_hash().await;
+    let playing = ctx.playlist_manager.get_song_playing().await;
+    let cached_total = match playing.as_ref() {
+        Some(song) => *ctx.duration_cache.lock().await.get(song).unwrap_or(&0),
+        None => 0,
+    };
+    drop(gate);
+
+    let (current, total) = match ctx.caster.get_progress().await {
         Ok(p) => {
-            let cached_total = get_total_duration().await;
-            let playing = ctx.playlist_manager.get_song_playing().await;
             debug!(
                 "progress: curr={} device_total={} cached_total={} playing={:?}",
                 p.current_secs, p.total_secs, cached_total, playing
@@ -152,7 +177,16 @@ pub async fn get_current_progress() -> (i32, i32) {
             (p.current_secs as i32, total)
         }
         Err(_) => (-1, -1),
+    };
+    let mut gate = ctx.playlist_manager.progress_gate.lock().await;
+    let (current, total) = gate.filter(revision, current, total);
+    // Validate the sample and consume once under the same lock as song updates
+    // and play confirmations. An old poll cannot trigger after a new playback.
+    if trigger_next && gate.auto_next.observe(current, total) {
+        info!("歌曲即将结束，启动一次自动切歌任务");
+        gate.auto_next.start_request(ctx.playlist_manager.clone(), hash, ctx.rt.handle());
     }
+    (current, total)
 }
 
 pub fn trigger_next_song() {
@@ -188,6 +222,39 @@ pub async fn jump_to_secs(target_secs: u32) -> Result<(), Box<dyn std::error::Er
         guard.as_ref().cloned().ok_or("Engine not initialized")?
     };
     ctx.caster.seek(target_secs).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// 1 = confirmed, 0 = no current song, -1 = failed/timed out/superseded, -2 = busy.
+pub async fn recast_current_song(ctx: &EngineContext) -> i32 {
+    let result = recast_with_caster(
+        &*ctx.caster, &ctx.playlist_manager.progress_gate,
+        &ctx.duration_cache, &ctx.playback_lock,
+    ).await;
+    if result == 1 {
+        ctx.is_playing.store(true, Ordering::SeqCst);
+    }
+    result
+}
+
+async fn recast_with_caster(
+    caster: &dyn cast::Caster,
+    gate: &Mutex<progress_gate::ProgressGate>,
+    cache: &Mutex<std::collections::HashMap<String, u32>>,
+    playback_lock: &Mutex<()>,
+) -> i32 {
+    let Ok(_playback) = playback_lock.try_lock() else { return -2 };
+    let Some((song, token)) = gate.lock().await.begin_recast() else { return 0 };
+    match tokio::time::timeout(Duration::from_secs(30), async {
+        prepare_duration(&song, cache).await;
+        play_and_confirm(caster, &song, token, gate).await
+    }).await {
+        Ok(true) => 1,
+        Ok(false) => -1,
+        Err(_) => {
+            warn!("重新投屏超时");
+            -1
+        }
+    }
 }
 
 pub async fn start_engine_core(
@@ -340,26 +407,24 @@ pub async fn connect_room(
 
     let caster_cb = Arc::clone(&caster);
     let cache_cb = Arc::clone(&cache);
+    let gate_cb = Arc::clone(&pm.progress_gate);
+    let playback_lock = Arc::new(Mutex::new(()));
+    let playback_cb = Arc::clone(&playback_lock);
     pm.start_sync(move |video_url| {
         let c = Arc::clone(&caster_cb);
         let cache = Arc::clone(&cache_cb);
+        let gate = Arc::clone(&gate_cb);
+        let playback = Arc::clone(&playback_cb);
         Box::pin(async move {
+            let _playback = playback.lock().await;
+            let Some(token) = gate.lock().await.play_token(&video_url) else { return };
             info!("通知设备准备拉取路径: {}", video_url);
             // 先写入 BV 的完整时长，再通知 DLNA 设备拉流。DASH/fMP4 的 moov
             // 可能只给 renderer 暴露首个分片（约 5 秒）的临时时长；若先播放，
             // Android 的自动切歌逻辑会把该临时时长误认为歌曲已结束。
-            if let Some((bvid,page)) = extract_bvid(&video_url) {
-                if let Ok((_, duration)) = crate::bilibili_parser::get_page_info(&bvid, page).await {
-                    if duration > 0 {
-                        cache.lock().await.insert(video_url.clone(), duration);
-                        info!(target: "DLNA1080", "播放前预填充 BV 视频时长: {},p{} -> {}s", bvid, page+1, duration);
-                    }
-                }
-            }
+            prepare_duration(&video_url, &cache).await;
 
-            if let Err(e) = c.play_song(&cast::SongRef(video_url.clone())).await {
-                warn!("自动切歌失败: {}", e);
-            }
+            play_and_confirm(&*c, &video_url, token, &gate).await;
         })
     });
 
@@ -370,6 +435,7 @@ pub async fn connect_room(
         local_ip: local_ip_addr,
         server_port: port,
         is_playing: AtomicBool::new(true),
+        playback_lock,
         // danmaku_on: AtomicBool::new(false),
         // quality_qn: AtomicU32::new(cast::Quality::default().as_qn()),
         rt,
@@ -381,6 +447,37 @@ pub async fn connect_room(
     }
 
     Ok(())
+}
+
+async fn prepare_duration(song: &str, cache: &Mutex<std::collections::HashMap<String, u32>>) {
+    if let Some((bvid, page)) = extract_bvid(song) {
+        if let Ok((_, duration)) = crate::bilibili_parser::get_page_info(&bvid, page).await {
+            if duration > 0 {
+                cache.lock().await.insert(song.to_owned(), duration);
+                info!(target: "DLNA1080", "播放前预填充 BV 视频时长: {},p{} -> {}s", bvid, page+1, duration);
+            }
+        }
+    }
+}
+
+async fn play_and_confirm(
+    caster: &dyn cast::Caster,
+    song: &str,
+    token: u64,
+    gate: &Mutex<progress_gate::ProgressGate>,
+) -> bool {
+    if gate.lock().await.revision() != token { return false; }
+    match caster.play_song(&cast::SongRef(song.to_owned())).await {
+        Ok(()) => {
+            gate.lock().await.play_succeeded(
+                token, caster.capabilities().hardware_progress, std::time::Instant::now(),
+            )
+        }
+        Err(error) => {
+            warn!("投屏失败: {}", error);
+            false
+        }
+    }
 }
 
 fn extract_bvid(video_url: &str) -> Option<(String,u32)> {
