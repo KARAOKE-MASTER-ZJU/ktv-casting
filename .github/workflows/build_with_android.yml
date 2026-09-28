@@ -115,6 +115,16 @@ jobs:
             cargo build --locked --release --target ${{ matrix.platform.target }}
           fi
 
+      - name: Verify Android JNI exports
+        if: matrix.platform.command == 'ndk'
+        shell: bash
+        run: |
+          LIB="target/${{ matrix.platform.target }}/release/lib${{ env.LIB_NAME }}.so"
+          readelf --dyn-syms --wide "$LIB" > jni-symbols.txt
+          for METHOD in initSessionDir pollPlaybackProgress recastCurrentSong setQuality jumpToSecs; do
+            grep -q "Java_zju_bangdream_ktv_casting_RustEngine_$METHOD$" jni-symbols.txt
+          done
+
       - name: Package Assets
         shell: bash
         run: |
