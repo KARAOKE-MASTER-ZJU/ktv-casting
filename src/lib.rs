@@ -244,7 +244,9 @@ async fn recast_with_caster(
 ) -> i32 {
     let Ok(_playback) = playback_lock.try_lock() else { return -2 };
     let Some((song, token)) = gate.lock().await.begin_recast() else { return 0 };
-    match tokio::time::timeout(Duration::from_secs(30), async {
+    // YouTube extraction (30s) and indexed DASH preparation (60s) precede
+    // the device commands. Allow that shared cold-start path to finish.
+    match tokio::time::timeout(Duration::from_secs(120), async {
         prepare_duration(&song, cache).await;
         play_and_confirm(caster, &song, token, gate).await
     }).await {

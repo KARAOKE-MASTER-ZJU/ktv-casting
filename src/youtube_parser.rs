@@ -142,7 +142,51 @@ async fn resolve_inner(input: &str, max_height: u32) -> io::Result<YoutubeDash> 
 
 #[cfg(test)]
 mod tests {
-    use super::video_id;
+    use super::{choose_tracks, video_id};
+    use innertube_rs::StreamingFormat;
+
+    fn indexed_format(itag: u32, mime: &str, height: Option<u32>) -> StreamingFormat {
+        let mut format = StreamingFormat::default();
+        format.itag = itag;
+        format.mime_type = mime.into();
+        format.height = height;
+        format.bitrate = 1000;
+        format.init_range = Some(serde_json::from_value(serde_json::json!({"start":"0","end":"99"})).unwrap());
+        format.index_range = Some(serde_json::from_value(serde_json::json!({"start":"100","end":"199"})).unwrap());
+        format
+    }
+
+    #[test]
+    fn chooses_compatible_tracks_within_the_quality_limit() {
+        let formats = vec![
+            indexed_format(136, "video/mp4; codecs=\"avc1.4d401f\"", Some(720)),
+            indexed_format(137, "video/mp4; codecs=\"avc1.640028\"", Some(1080)),
+            indexed_format(400, "video/mp4; codecs=\"av01.0.08M.08\"", Some(1080)),
+            indexed_format(140, "audio/mp4; codecs=\"mp4a.40.2\"", None),
+            indexed_format(251, "audio/webm; codecs=\"opus\"", None),
+        ];
+        for (limit, expected) in [(720, 136), (1080, 137), (2160, 137)] {
+            let (video, audio) = choose_tracks(&formats, limit).unwrap();
+            assert_eq!((video.itag, audio.itag), (expected, 140));
+        }
+        assert!(choose_tracks(&formats, 360).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_audio_indexes_and_drm_without_falling_back_to_a_page_url() {
+        let video = indexed_format(137, "video/mp4; codecs=\"avc1.640028\"", Some(1080));
+        let audio = indexed_format(140, "audio/mp4; codecs=\"mp4a.40.2\"", None);
+        assert!(choose_tracks(std::slice::from_ref(&video), 1080).is_err());
+        let mut no_index = video.clone();
+        no_index.index_range = None;
+        assert!(choose_tracks(&[no_index, audio.clone()], 1080).is_err());
+        let mut drm = video.clone();
+        drm.drm_families = Some(vec!["WIDEVINE".into()]);
+        assert!(choose_tracks(&[drm, audio.clone()], 1080).is_err());
+        let mut no_init = audio;
+        no_init.init_range = None;
+        assert!(choose_tracks(&[video, no_init], 1080).is_err());
+    }
 
     #[test]
     fn accepts_only_youtube_video_pages() {

@@ -1,6 +1,6 @@
 [package]
 name = "ktv-casting"
-version = "1.9.0-dev.dlna-seek.1"
+version = "1.10.0-dev.youtube.1"
 edition = "2024"
 
 [lib]
@@ -66,6 +66,9 @@ android_logger = "0.15.1"
 
 [features]
 default = []
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["test-util"] }
 
 [patch.crates-io]
 rupnp = { git = "https://github.com/aspromise/rupnp.git", branch = "fix/control-endpoint-leading-slash" }

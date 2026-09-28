@@ -139,7 +139,7 @@ async fn missing_current_song_does_not_send_a_play_command() {
     assert!(caster.songs.lock().await.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recast_timeout_releases_busy_state_for_another_attempt() {
     let caster = TestCaster::new(false, false);
     let gate = setup(240).await;
@@ -148,6 +148,23 @@ async fn recast_timeout_releases_busy_state_for_another_attempt() {
     assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, -1);
     caster.reply.notify_one();
     assert_eq!(recast_with_caster(&caster, &gate, &cache, &playback).await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recast_allows_cold_dash_preparation_beyond_thirty_seconds() {
+    let caster = TestCaster::new(true, false);
+    let gate = setup(240).await;
+    let cache = Mutex::new(Default::default());
+    let playback = Mutex::new(());
+    let (result, ()) = tokio::join!(
+        recast_with_caster(&caster, &gate, &cache, &playback),
+        async {
+            caster.started.notified().await;
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            caster.reply.notify_one();
+        },
+    );
+    assert_eq!(result, 1);
 }
 
 async fn setup(current: i32) -> Mutex<progress_gate::ProgressGate> {
