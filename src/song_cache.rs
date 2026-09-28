@@ -341,7 +341,7 @@ pub async fn fetch_range(
     }
     let response = client
         .get(url)
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", crate::upstream::user_agent(url))
         .header("Referer", crate::upstream::referer(url))
         .header("Accept-Encoding", "identity")
         .header("Range", format!("bytes={}-{}", range.start, range.end - 1))
@@ -350,6 +350,12 @@ pub async fn fetch_range(
         .await
         .map_err(|e| io::Error::other(e.without_url()))?;
     let expected = format!("bytes {}-{}/{}", range.start, range.end - 1, total);
+    if !response.status().is_success() {
+        return Err(io::Error::other(format!(
+            "upstream HTTP {} while requesting {expected}",
+            response.status()
+        )));
+    }
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
         || response
             .headers()

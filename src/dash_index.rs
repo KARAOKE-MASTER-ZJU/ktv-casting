@@ -104,7 +104,7 @@ async fn source_length(client: &reqwest::Client, url: &str) -> io::Result<u64> {
         .get(url)
         .header("Range", "bytes=0-7")
         .header("Referer", crate::upstream::referer(url))
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", crate::upstream::user_agent(url))
         .header("Accept-Encoding", "identity")
         .timeout(Duration::from_secs(10))
         .send()
