@@ -1,14 +1,15 @@
 name: Cross-Platform Build & Release
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
     # branches: ["android-app", "main"] 只有打tag才会触发构建，避免频繁触发
     tags: ["v*"]
   pull_request:
-    branches: ["android-app"]
+    branches: ["master", "android-app"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -97,7 +98,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.platform.command }}" == "ndk" ]; then
-            cargo install cargo-ndk
+            cargo install cargo-ndk --locked
           elif [ "${{ matrix.platform.command }}" == "cross" ]; then
             cargo install cross --git https://github.com/cross-rs/cross
           fi
@@ -107,11 +108,11 @@ jobs:
         run: |
           if [ "${{ matrix.platform.command }}" == "ndk" ]; then
             # Android: 只编译库
-            cargo ndk -t ${{ matrix.platform.abi }} build --release --lib
+            cargo ndk -t ${{ matrix.platform.abi }} build --locked --release --lib
           elif [ "${{ matrix.platform.command }}" == "cross" ]; then
-            cross build --release --target ${{ matrix.platform.target }}
+            cross build --locked --release --target ${{ matrix.platform.target }}
           else
-            cargo build --release --target ${{ matrix.platform.target }}
+            cargo build --locked --release --target ${{ matrix.platform.target }}
           fi
 
       - name: Package Assets
@@ -139,13 +140,34 @@ jobs:
           path: dist/*
           retention-days: 7
 
+  publish:
+    name: Publish complete release
+    needs: build-and-upload
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify complete asset set
+        shell: bash
+        run: |
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -s "dist/libktv_casting_lib-$ABI.so"
+          done
+          test "$(find dist -type f | wc -l)" -eq 7
+          cd dist
+          sha256sum * > SHA256SUMS
       - name: Publish Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-dev.') }}
+          fail_on_unmatched_files: true
 
 #  dispatch-to-android:
 #    name: Dispatch Android App Build

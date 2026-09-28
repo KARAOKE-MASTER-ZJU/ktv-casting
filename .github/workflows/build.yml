@@ -1,108 +1,19 @@
-name: Cross-Platform Build & Release
+name: Rust Tests
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
-    branches: [ "master" ]
-    # tags: [ "v*" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
-
-env:
-  CARGO_TERM_COLOR: always
-  BIN_NAME: ktv-cli
+    branches: ["master", "android-app"]
 
 jobs:
-  build-and-upload:
-    name: Build - ${{ matrix.platform.release_for }}
-    runs-on: ${{ matrix.platform.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          # 1. Android ARM64
-          - release_for: Android-aarch64
-            os: ubuntu-latest
-            # 修改 target 为 android
-            target: aarch64-linux-android
-            command: cross
-            # Android 默认开启 PIE，通常留空即可；如果报错再尝试加上
-            rustflags: ""
-
-          # 2. Linux x64 (Musl)
-          - release_for: Linux-x86_64-musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            command: cross
-            rustflags: ""
-
-          # 3. Windows x64 (MSVC) - 不需要 PIE flags
-          - release_for: Windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            command: cargo
-            rustflags: ""
-
-          # 4. macOS ARM64 - 不需要手动指定，默认即可
-          - release_for: macOS-aarch64
-            os: macos-14
-            target: aarch64-apple-darwin
-            command: cargo
-            rustflags: ""
-
+  test:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: "${{ matrix.platform.target }}"
-
-      - name: Install Cross
-        if: matrix.platform.command == 'cross'
-        shell: bash
-        run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build Binary
-        shell: bash
-        run: |
-          # 导出 RUSTFLAGS 环境变量
-          export RUSTFLAGS="${{ matrix.platform.rustflags }}"
-          
-          echo "Building for ${{ matrix.platform.target }} with flags: $RUSTFLAGS"
-
-          if [ "${{ matrix.platform.command }}" == "cross" ]; then
-            cross build --release --target ${{ matrix.platform.target }}
-          else
-            cargo build --release --target ${{ matrix.platform.target }}
-          fi
-
-      - name: Rename and Move Binary
-        shell: bash
-        run: |
-          mkdir -p dist
-          
-          # 根据平台设置扩展名
-          if [ "${{ matrix.platform.os }}" == "windows-latest" ]; then
-            EXT=".exe"
-          else
-            EXT=""
-          fi
-          
-          SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}$EXT"
-          DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}$EXT"
-          
-          echo "Moving $SRC to $DST"
-          cp "$SRC" "$DST"
-
-      - name: Publish Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: dist/*
-          generate_release_notes: true
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --lib

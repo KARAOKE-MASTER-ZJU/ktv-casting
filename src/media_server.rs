@@ -395,6 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires public Bilibili access"]
     async fn test_https() {
         let client = reqwest::Client::new();
 
@@ -409,6 +410,7 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[ignore = "manual long-running proxy server"]
     async fn test_proxy() -> std::io::Result<()> {
         // 在外面创建全局唯一的 Client，内部已配置好纯 Rustls
         let client = Client::builder()

@@ -907,6 +907,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires a real DLNA renderer and changes its next URI"]
     async fn test_set_next_avtransport_uri() {
         let controller = DlnaController::new();
 
