@@ -259,7 +259,7 @@ impl Mp4Builder {
             let mut cursor = None;
             for trun in children(traf)?.into_iter().filter(|c| &c[4..8] == b"trun") {
                 let rh = header(trun)?;
-                let version = trun[rh];
+                let version = *trun.get(rh).ok_or_else(|| invalid("short trun"))?;
                 if version > 1 {
                     return Err(invalid("invalid trun version"));
                 }
@@ -673,6 +673,14 @@ mod tests {
             ),
         )
     }
+
+    #[test]
+    fn empty_track_run_returns_error_instead_of_panicking() {
+        let mut builder = builder(false);
+        let error = builder.add_fragment(0, 100, &fragment(0, vec![])).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     fn builder(edit: bool) -> Mp4Builder {
         Mp4Builder::new(
             &box_of(b"ftyp", b"isom\0\0\0\0isommp41".to_vec()),
