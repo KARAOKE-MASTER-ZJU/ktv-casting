@@ -65,6 +65,7 @@ mod tests {
     use crate::bilibili_parser::get_bilibili_direct_link;
 
     #[tokio::test]
+    #[ignore = "requires public Bilibili access"]
     async fn test_get_duration_from_bilibili() {
         let bv_id = "BV1DWrABZEPi";
 

@@ -489,6 +489,7 @@ impl PlaylistManager {
 mod automatic_next_tests;
 
 #[tokio::test]
+#[ignore = "manual live-room example; mutates the remote playlist"]
 async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== PlaylistManager 使用示例 ===");
 

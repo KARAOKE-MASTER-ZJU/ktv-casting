@@ -10,6 +10,11 @@ pub struct DlnaCaster {
     server_ip: IpAddr,
     server_port: u16,
     current_song: std::sync::Mutex<Option<String>>,
+    sessions: Option<std::sync::Arc<crate::media_session::MediaSessions>>,
+    media_client: reqwest::Client,
+    transport: tokio::sync::Mutex<()>,
+    seek_sequence: std::sync::atomic::AtomicU64,
+    loaded_generation: std::sync::atomic::AtomicU64,
 }
 
 impl DlnaCaster {
@@ -25,7 +30,23 @@ impl DlnaCaster {
             server_ip,
             server_port,
             current_song: std::sync::Mutex::new(None),
+            sessions: None,
+            media_client: reqwest::Client::builder()
+                .connect_timeout(crate::PROXY_CONNECT_TIMEOUT)
+                .build()
+                .expect("valid media client"),
+            transport: tokio::sync::Mutex::new(()),
+            seek_sequence: std::sync::atomic::AtomicU64::new(0),
+            loaded_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub fn with_sessions(
+        mut self,
+        sessions: std::sync::Arc<crate::media_session::MediaSessions>,
+    ) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     async fn reload_song_at(
@@ -35,12 +56,29 @@ impl DlnaCaster {
         reason: &str,
     ) -> Result<(), CastError> {
         let quality = crate::get_dlna_quality();
-        let media_url = if quality == Quality::P1080 {
+        let session = self
+            .sessions
+            .as_ref()
+            .map(|sessions| sessions.activate(song, quality));
+        let media_url = if let Some(session) = &session {
+            session
+                .prepare(&self.media_client)
+                .await
+                .map_err(|error| CastError::Device(error.to_string()))?;
+            session.path()
+        } else if quality == Quality::P1080 {
             with_start_offset(song, position)
         } else {
             song.to_owned()
         };
+        let _transport = self.transport.lock().await;
+        if session.as_ref().is_some_and(|s| s.is_stopped()) {
+            return Err(CastError::Device("曲目准备已被新请求替代".into()));
+        }
         let _ = self.controller.stop(&self.device).await;
+        if session.as_ref().is_some_and(|s| s.is_stopped()) {
+            return Err(CastError::Device("播放请求已过期".into()));
+        }
         self.controller
             .set_avtransport_uri(
                 &self.device,
@@ -51,11 +89,19 @@ impl DlnaCaster {
             )
             .await
             .map_err(e)?;
+        if session.as_ref().is_some_and(|s| s.is_stopped()) {
+            return Err(CastError::Device("播放请求已过期".into()));
+        }
         self.controller.play(&self.device).await.map_err(e)?;
+        if let Some(session) = &session {
+            self.loaded_generation
+                .store(session.generation, std::sync::atomic::Ordering::Relaxed);
+        }
 
-        if quality == Quality::P720 && position > 0 {
+        if (session.is_some() || quality == Quality::P720) && position > 0 {
             if let Err(error) = self.controller.seek(&self.device, position).await {
-                log::warn!(target: "DLNA1080", "720P 重载后恢复进度失败: position={}s, error={}", position, error);
+                log::warn!(target: "DLNA1080", "切换媒体后恢复进度失败: quality={}, position={}s, error={}", quality.label(), position, error);
+                return Err(e(error));
             }
         }
         log::info!(
@@ -87,34 +133,44 @@ fn e(err: rupnp::Error) -> CastError {
     CastError::Device(err.to_string())
 }
 
+impl Drop for DlnaCaster {
+    fn drop(&mut self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.clear();
+        }
+    }
+}
+
 #[async_trait]
 impl Caster for DlnaCaster {
     async fn play_song(&self, song: &SongRef) -> Result<(), CastError> {
         if let Ok(mut current) = self.current_song.lock() {
             *current = Some(song.0.clone());
         }
-        let _ = self.controller.stop(&self.device).await;
-        self.controller
-            .set_avtransport_uri(&self.device, &song.0, "", self.server_ip, self.server_port)
-            .await
-            .map_err(e)?;
-        self.controller.play(&self.device).await.map_err(e)
+        self.seek_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.reload_song_at(&song.0, 0, "播放歌曲").await
     }
 
     async fn resume(&self) -> Result<(), CastError> {
+        let _transport = self.transport.lock().await;
         self.controller.play(&self.device).await.map_err(e)
     }
 
     async fn pause(&self) -> Result<(), CastError> {
+        let _transport = self.transport.lock().await;
         self.controller.pause(&self.device).await.map_err(e)
     }
 
     async fn stop(&self) -> Result<(), CastError> {
+        self.seek_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _transport = self.transport.lock().await;
         self.controller.stop(&self.device).await.map_err(e)
     }
 
     async fn seek(&self, secs: u32) -> Result<(), CastError> {
-        if crate::get_dlna_quality() == Quality::P1080 {
+        if self.sessions.is_none() && crate::get_dlna_quality() == Quality::P1080 {
             let song = self
                 .current_song
                 .lock()
@@ -124,7 +180,43 @@ impl Caster for DlnaCaster {
             log::info!(target: "DLNA1080", "1080P 定位请求: {}s；通过 start 参数重开混流", secs);
             return self.reload_song_at(&song, secs, "1080P 定位").await;
         }
-        self.controller.seek(&self.device, secs).await.map_err(e)
+        let sequence = self
+            .seek_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let _transport = self.transport.lock().await;
+        if sequence
+            != self
+                .seek_sequence
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let mut old_streams = None;
+        if let Some(sessions) = &self.sessions {
+            if let Some(session) = sessions
+                .get(
+                    self.loaded_generation
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            {
+                old_streams = session.seek_stream_cutoff();
+                session.warm_seek(secs);
+            } else {
+                return Err(CastError::Device("新曲目正在准备，尚不能定位".into()));
+            }
+        }
+        let started = std::time::Instant::now();
+        let result = self.controller.seek(&self.device, secs).await.map_err(e);
+        if result.is_ok() {
+            if let Some((cache, cutoff)) = old_streams {
+                // Cancel only streams present before the accepted command.
+                // A fast renderer may already have opened its new Range GET.
+                cache.retire_streams(cutoff);
+            }
+        }
+        log::info!(target: "DLNA1080", "原生 DLNA 定位指令返回: target={}s, command_ms={}, success={}（不代表画面已恢复）", secs, started.elapsed().as_millis(), result.is_ok());
+        result
     }
 
     async fn get_progress(&self) -> Result<Progress, CastError> {
@@ -155,6 +247,9 @@ impl Caster for DlnaCaster {
 
     async fn set_quality(&self, quality: Quality) -> Result<(), CastError> {
         let previous = crate::get_dlna_quality();
+        if previous == quality {
+            return Ok(());
+        }
         log::info!(target: "DLNA1080", "切换 DLNA 清晰度: {} -> {}", previous.label(), quality.label());
         let position = self
             .controller

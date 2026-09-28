@@ -35,9 +35,16 @@ pub mod bilibili_parser;
 pub mod cast;
 pub mod dlna_controller;
 pub mod fmp4_mux;
+pub mod seekable_mp4;
+pub mod song_cache;
+pub mod virtual_mp4_http;
+pub mod dash_index;
+pub mod media_session;
 pub mod media_server;
 pub mod mp4_util;
 pub mod playlist_manager;
+pub mod youtube_parser;
+pub mod upstream;
 mod auto_next;
 mod progress_gate;
 #[cfg(test)]
@@ -94,6 +101,7 @@ pub struct EngineContext {
 pub struct SharedState {
     pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
     pub eplus_auth: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub media_sessions: Arc<media_session::MediaSessions>,
 }
 
 pub(crate) fn get_best_local_ip(target_device_ip: &str) -> String {
@@ -236,7 +244,9 @@ async fn recast_with_caster(
 ) -> i32 {
     let Ok(_playback) = playback_lock.try_lock() else { return -2 };
     let Some((song, token)) = gate.lock().await.begin_recast() else { return 0 };
-    match tokio::time::timeout(Duration::from_secs(30), async {
+    // YouTube extraction (30s) and indexed DASH preparation (60s) precede
+    // the device commands. Allow that shared cold-start path to finish.
+    match tokio::time::timeout(Duration::from_secs(120), async {
         prepare_duration(&song, cache).await;
         play_and_confirm(caster, &song, token, gate).await
     }).await {
@@ -271,11 +281,12 @@ pub async fn start_engine_core(
     info!(target: "DLNA1080", "DLNA 新会话默认清晰度: 720P");
 
     let handle = rt.handle().clone();
-    let (controller, device, local_ip_addr, port, cache, _) =
+    let (controller, device, local_ip_addr, port, cache, shared_state) =
         connect_dlna_device(loc_str, handle).await?;
 
     let caster: Arc<dyn cast::Caster> =
-        Arc::new(DlnaCaster::new(controller, device, local_ip_addr, port));
+        Arc::new(DlnaCaster::new(controller, device, local_ip_addr, port)
+            .with_sessions(shared_state.media_sessions.clone()));
 
     connect_room(base_url_str, room_id, caster, local_ip_addr, port, cache, rt).await?;
 
@@ -321,6 +332,7 @@ pub async fn connect_dlna_device(
     let shared_state = web::Data::new(SharedState {
         duration_cache: cache.clone(),
         eplus_auth: Arc::new(tokio::sync::Mutex::new(None)),
+        media_sessions: Arc::new(media_session::MediaSessions::default()),
     });
     // 通知旧服务器关闭（防止端口冲突）
     if let Ok(mut guard) = MEDIA_SERVER_SHUTDOWN.write() {

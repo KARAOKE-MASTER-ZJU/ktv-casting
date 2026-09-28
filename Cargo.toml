@@ -1,6 +1,6 @@
 [package]
 name = "ktv-casting"
-version = "0.1.0"
+version = "1.10.0-dev.youtube.1"
 edition = "2024"
 
 [lib]
@@ -51,6 +51,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.10"
 md5 = "0.7"
+innertube-rs = "0.9.0"
 
 # CLI 专用依赖（仅非 Android target 可见）
 [target.'cfg(not(target_os = "android"))'.dependencies]
@@ -62,9 +63,15 @@ qr2term = "0.2"
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 android_logger = "0.15.1"
+# rquickjs 0.9 does not bundle Android bindings. Generate them against the NDK
+# for each ABI; this unifies the feature on innertube-rs's existing dependency.
+rquickjs = { version = "0.9.0", default-features = false, features = ["bindgen"] }
 
 [features]
 default = []
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["test-util"] }
 
 [patch.crates-io]
 rupnp = { git = "https://github.com/aspromise/rupnp.git", branch = "fix/control-endpoint-leading-slash" }
