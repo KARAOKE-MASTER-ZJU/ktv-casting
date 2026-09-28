@@ -164,9 +164,18 @@ mod tests {
     #[actix_web::test]
     #[ignore = "requires live YouTube access"]
     async fn public_video_can_prepare_for_dlna() {
+        check_public_video(crate::cast::Quality::P720, 720).await;
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires live YouTube access"]
+    async fn public_video_1080p_can_prepare_for_dlna() {
+        check_public_video(crate::cast::Quality::P1080, 1080).await;
+    }
+
+    async fn check_public_video(quality: crate::cast::Quality, expected_height: u16) {
         use crate::{
             SharedState,
-            cast::Quality,
             media_server::proxy_handler,
             media_session::{MediaSessions, SessionMedia},
         };
@@ -178,8 +187,8 @@ mod tests {
         use std::{collections::HashMap, sync::Arc};
 
         let sessions = Arc::new(MediaSessions::default());
-        let session =
-            sessions.activate("https://www.youtube.com/watch?v=dQw4w9WgXcQ", Quality::P720);
+        let session = sessions.activate("https://www.youtube.com/watch?v=dQw4w9WgXcQ", quality);
+        let started = std::time::Instant::now();
         let client = reqwest::Client::new();
         let media = session
             .prepare(&client)
@@ -189,6 +198,35 @@ mod tests {
             panic!("YouTube must be proxied as a seekable MP4");
         };
         assert!(mp4.len > mp4.prefix.len() as u64);
+        // Inspect the actual muxed representation: a lower-resolution fallback
+        // must not count as a successful test of the requested quality.
+        let parsed = mp4::Mp4Reader::read_header(std::io::Cursor::new(&mp4.prefix), mp4.len)
+            .expect("parse muxed MP4 header");
+        assert_eq!(parsed.tracks().len(), 2);
+        let video = parsed
+            .tracks()
+            .values()
+            .find(|track| track.media_type().ok() == Some(mp4::MediaType::H264))
+            .expect("muxed H.264 video track");
+        assert_eq!(
+            video.height(),
+            expected_height,
+            "unexpected quality fallback"
+        );
+        assert!(
+            parsed
+                .tracks()
+                .values()
+                .any(|track| track.media_type().ok() == Some(mp4::MediaType::AAC))
+        );
+        eprintln!(
+            "Muxed output: {}x{}, H.264 + AAC, duration={:?}, bytes={}, prepare={:?}",
+            video.width(),
+            video.height(),
+            parsed.duration(),
+            mp4.len,
+            started.elapsed()
+        );
         let first_media_byte = mp4.prefix.len();
         let state = web::Data::new(SharedState {
             duration_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -212,14 +250,26 @@ mod tests {
             head_response.headers().get("content-type").unwrap(),
             "video/mp4"
         );
-        let get = test::TestRequest::with_uri(&path)
-            .insert_header((
-                "Range",
-                format!("bytes={first_media_byte}-{}", first_media_byte + 1023),
-            ))
-            .to_request();
-        let response = test::call_service(&app, get).await;
-        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(test::read_body(response).await.len(), 1024);
+        for start in [first_media_byte as u64, mp4.len / 2, mp4.len - 65536] {
+            let get = test::TestRequest::with_uri(&path)
+                .insert_header(("Range", format!("bytes={start}-{}", start + 65535)))
+                .to_request();
+            let response = test::call_service(&app, get).await;
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-range")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                format!("bytes {start}-{}/{}", start + 65535, mp4.len)
+            );
+            assert_eq!(test::read_body(response).await.len(), 65536);
+            eprintln!(
+                "Proxy Range passed: {start}-{} (65536 bytes)",
+                start + 65535
+            );
+        }
     }
 }

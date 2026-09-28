@@ -93,7 +93,10 @@ YouTube 代理的手动网络验证（需能访问 YouTube）：
 
 ```bash
 cargo test --lib youtube_parser::tests::public_video_can_prepare_for_dlna -- --ignored --nocapture
+cargo test --lib youtube_parser::tests::public_video_1080p_can_prepare_for_dlna -- --ignored --nocapture
 ```
+
+2026-09-28 的 1080P 网络测试通过：公开视频 `dQw4w9WgXcQ` 的混流输出经 MP4 头解析确认是 1920×1080、H.264 + AAC、213.089 秒；准备约 12.3 秒，代理 HEAD 与开头/中间/末尾各 64 KiB 的 Range GET 均通过。该测试不包含电视解码播放或 Android 实机验证。
 
 
 ---
