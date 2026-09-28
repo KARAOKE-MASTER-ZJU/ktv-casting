@@ -109,7 +109,37 @@ async fn resolve_inner(input: &str, max_height: u32) -> io::Result<YoutubeDash> 
         .get_or_try_init(|| async { Innertube::new().await })
         .await
         .map_err(io::Error::other)?;
-    let response = yt.get_video_info(&id).await.map_err(io::Error::other)?;
+    // The high-level get_video_info silently falls back to IOS, whose CDN
+    // URLs can read the beginning but return 403 for later ranges without PO
+    // attestation. Request VISIONOS explicitly and preserve its failure rather
+    // than returning a different client's unusable tracks.
+    let response = yt
+        .session
+        .post_innertube_client(
+            "VISIONOS",
+            "/player",
+            serde_json::json!({
+                "videoId": id,
+                "contentCheckOk": true,
+                "racyCheckOk": true
+            }),
+        )
+        .await
+        .map_err(io::Error::other)?
+        .json::<innertube_rs::PlayerResponse>()
+        .await
+        .map_err(|error| io::Error::other(error.without_url()))?;
+    if response.playability_status.status != "OK" {
+        return Err(io::Error::other(format!(
+            "YouTube video is not playable: {} ({})",
+            response.playability_status.status,
+            response
+                .playability_status
+                .reason
+                .as_deref()
+                .unwrap_or("no reason provided")
+        )));
+    }
     let data = response.streaming_data.as_ref().ok_or_else(|| {
         io::Error::other(format!(
             "YouTube video is not streamable: {}",
@@ -151,8 +181,10 @@ mod tests {
         format.mime_type = mime.into();
         format.height = height;
         format.bitrate = 1000;
-        format.init_range = Some(serde_json::from_value(serde_json::json!({"start":"0","end":"99"})).unwrap());
-        format.index_range = Some(serde_json::from_value(serde_json::json!({"start":"100","end":"199"})).unwrap());
+        format.init_range =
+            Some(serde_json::from_value(serde_json::json!({"start":"0","end":"99"})).unwrap());
+        format.index_range =
+            Some(serde_json::from_value(serde_json::json!({"start":"100","end":"199"})).unwrap());
         format
     }
 
@@ -204,7 +236,8 @@ mod tests {
     }
 
     /// Manual network smoke test: validates both the extractor and the existing
-    /// indexed DASH path against a public video, without a DLNA renderer.
+    /// indexed DASH path against the reported 241-second failure, without a
+    /// DLNA renderer. Midpoint/tail reads must pass beyond the initial window.
     #[actix_web::test]
     #[ignore = "requires live YouTube access"]
     async fn public_video_can_prepare_for_dlna() {
@@ -231,7 +264,7 @@ mod tests {
         use std::{collections::HashMap, sync::Arc};
 
         let sessions = Arc::new(MediaSessions::default());
-        let session = sessions.activate("https://www.youtube.com/watch?v=dQw4w9WgXcQ", quality);
+        let session = sessions.activate("https://www.youtube.com/watch?v=_1gTMhvRtB8", quality);
         let started = std::time::Instant::now();
         let client = reqwest::Client::new();
         let media = session
