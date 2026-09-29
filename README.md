@@ -16,7 +16,6 @@
   - **DLNA 模式**：通过 UPnP/SSDP 发现局域网内的 DLNA 渲染器，使用 SOAP (AVTransport) 控制播放
   - **Bilibili 模式**：通过 B 站扫码登录，投屏到 Bilibili TV 端设备（小电视/盒子等）
 - **本地媒体代理**：自动将 B 站视频链接转为 DLNA 设备可拉取的 HTTP 流（默认 `0.0.0.0:8080`），支持 Range 请求与进度拖拽
-- **YouTube DLNA 实验支持**：识别公开 YouTube 视频链接，在本机解析 H.264/AAC 双轨并复用可定位 MP4 代理；电视只访问本机地址。需要视频提供带索引的 MP4 DASH 轨，部分受限视频可能无法播放
 - **实时同步**：支持 WebSocket（默认，低延迟）和 HTTP 轮询两种模式，与点歌台保持歌曲列表同步
 - **自动切歌**：检测歌曲播放结束后自动切换到下一首
 - **音量控制**：通过 DLNA RenderingControl 服务调节音量
@@ -59,8 +58,6 @@ cargo run --release
 
 直接安装 [ktv-casting-android-app](https://github.com/KARAOKE-MASTER-ZJU/ktv-casting-android-app) 即可获得完整 UI 体验。
 
-YouTube 实验功能的解析和代理均在 Rust 引擎中，不依赖 `yt-dlp` 或外部进程。Android App 需要集成由本分支构建的新 JNI 库；尚未完成 Android 实机验证。
-
 ---
 
 ## 环境变量
@@ -91,15 +88,6 @@ cargo install cargo-ndk
 rustup target add aarch64-linux-android
 cargo ndk -t arm64-v8a build --lib --release
 ```
-
-YouTube 代理的手动网络验证（需能访问 YouTube）：
-
-```bash
-cargo test --lib youtube_parser::tests::public_video_can_prepare_for_dlna -- --ignored --nocapture
-cargo test --lib youtube_parser::tests::public_video_1080p_can_prepare_for_dlna -- --ignored --nocapture
-```
-
-2026-09-28 的 1080P 网络测试通过：公开视频 `dQw4w9WgXcQ` 的混流输出经 MP4 头解析确认是 1920×1080、H.264 + AAC、213.089 秒；准备约 12.3 秒，代理 HEAD 与开头/中间/末尾各 64 KiB 的 Range GET 均通过。该测试不包含电视解码播放或 Android 实机验证。
 
 
 ---
