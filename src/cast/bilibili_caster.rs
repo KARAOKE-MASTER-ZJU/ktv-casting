@@ -1,5 +1,5 @@
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use async_trait::async_trait;
@@ -292,20 +292,57 @@ pub fn clear_session() -> Result<(), String> {
 }
 
 pub async fn list_devices(session: &BilibiliSession) -> Result<Vec<BilibiliDevice>, String> {
-    let json: Value = bili_client()
-        .get(format!("{}/x/tv/projection/devices", API_HOST))
+    let endpoint = format!("{}/x/tv/projection/devices", API_HOST);
+    let started = Instant::now();
+    let response = bili_client()
+        .get(&endpoint)
         .query(&[
             ("access_key", session.access_token.as_str()),
             ("appkey", APPKEY),
         ])
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
+        .map_err(|error| devices_request_failure("发送请求", &endpoint, started, None, error))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| devices_request_failure("读取响应", &endpoint, started, Some(status), error))?;
+    let json: Value = serde_json::from_slice(&bytes).map_err(|error| format!(
+        "[Bilibili] 获取设备列表失败：步骤=解析JSON响应，请求=GET {endpoint}，耗时={}ms，超时设置={}ms，HTTP={}，错误链={error}",
+        started.elapsed().as_millis(), crate::API_TIMEOUT.as_millis(), status.as_u16(),
+    ))?;
 
     parse_devices_response(json)
+}
+
+fn devices_request_failure(
+    stage: &str,
+    endpoint: &str,
+    started: Instant,
+    status: Option<reqwest::StatusCode>,
+    error: reqwest::Error,
+) -> String {
+    // reqwest's URL contains access_key; remove it before formatting the error chain.
+    let error = error.without_url();
+    let mut causes = vec![error.to_string()];
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    let http = status.map(|status| format!("，HTTP={}", status.as_u16())).unwrap_or_default();
+    format!(
+        "[Bilibili] 获取设备列表失败：步骤={stage}，请求=GET {endpoint}，耗时={}ms，超时设置={}ms{http}，is_timeout={}，is_connect={}，is_request={}，is_body={}，is_decode={}，错误链={}",
+        started.elapsed().as_millis(),
+        crate::API_TIMEOUT.as_millis(),
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body(),
+        error.is_decode(),
+        causes.join(" -> "),
+    )
 }
 
 pub struct BilibiliCaster {
