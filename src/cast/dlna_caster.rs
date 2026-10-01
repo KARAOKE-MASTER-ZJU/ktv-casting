@@ -64,7 +64,7 @@ impl DlnaCaster {
             session
                 .prepare(&self.media_client)
                 .await
-                .map_err(|error| CastError::Device(error.to_string()))?;
+                .map_err(|error| self.failure("准备媒体", error))?;
             session.path()
         } else if quality == Quality::P1080 {
             with_start_offset(song, position)
@@ -88,11 +88,12 @@ impl DlnaCaster {
                 self.server_port,
             )
             .await
-            .map_err(e)?;
+            .map_err(|error| self.failure("设置媒体地址", error))?;
         if session.as_ref().is_some_and(|s| s.is_stopped()) {
             return Err(CastError::Device("播放请求已过期".into()));
         }
-        self.controller.play_for_cast(&self.device).await.map_err(e)?;
+        self.controller.play_for_cast(&self.device).await
+            .map_err(|error| self.failure("发送播放指令", error))?;
         if let Some(session) = &session {
             self.loaded_generation
                 .store(session.generation, std::sync::atomic::Ordering::Relaxed);
@@ -101,7 +102,7 @@ impl DlnaCaster {
         if (session.is_some() || quality == Quality::P720) && position > 0 {
             if let Err(error) = self.controller.seek(&self.device, position).await {
                 log::warn!(target: "DLNA1080", "切换媒体后恢复进度失败: quality={}, position={}s, error={}", quality.label(), position, error);
-                return Err(e(error));
+                return Err(self.failure("恢复播放进度", error));
             }
         }
         log::info!(
@@ -112,6 +113,13 @@ impl DlnaCaster {
             position
         );
         Ok(())
+    }
+
+    fn failure(&self, step: &str, error: impl std::fmt::Display) -> CastError {
+        let message = format!("[DLNA] {}失败：设备={}，设备地址={}，错误={}",
+            step, self.device.friendly_name, self.device.location, error);
+        log::warn!("{}", message);
+        CastError::Device(message)
     }
 }
 
@@ -127,10 +135,6 @@ fn with_start_offset(song: &str, position: u32) -> String {
     } else {
         format!("{path}?{prefix}&start={position}")
     }
-}
-
-fn e(err: rupnp::Error) -> CastError {
-    CastError::Device(err.to_string())
 }
 
 impl Drop for DlnaCaster {
@@ -154,19 +158,22 @@ impl Caster for DlnaCaster {
 
     async fn resume(&self) -> Result<(), CastError> {
         let _transport = self.transport.lock().await;
-        self.controller.play(&self.device).await.map_err(e)
+        self.controller.play(&self.device).await
+            .map_err(|error| self.failure("继续播放", error))
     }
 
     async fn pause(&self) -> Result<(), CastError> {
         let _transport = self.transport.lock().await;
-        self.controller.pause(&self.device).await.map_err(e)
+        self.controller.pause(&self.device).await
+            .map_err(|error| self.failure("暂停", error))
     }
 
     async fn stop(&self) -> Result<(), CastError> {
         self.seek_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _transport = self.transport.lock().await;
-        self.controller.stop(&self.device).await.map_err(e)
+        self.controller.stop(&self.device).await
+            .map_err(|error| self.failure("停止播放", error))
     }
 
     async fn seek(&self, secs: u32) -> Result<(), CastError> {
@@ -207,7 +214,8 @@ impl Caster for DlnaCaster {
             }
         }
         let started = std::time::Instant::now();
-        let result = self.controller.seek(&self.device, secs).await.map_err(e);
+        let result = self.controller.seek(&self.device, secs).await
+            .map_err(|error| self.failure("定位", error));
         if result.is_ok() {
             if let Some((cache, cutoff)) = old_streams {
                 // Cancel only streams present before the accepted command.
@@ -227,14 +235,14 @@ impl Caster for DlnaCaster {
                 current_secs: curr,
                 total_secs: total,
             })
-            .map_err(e)
+            .map_err(|error| self.failure("查询进度", error))
     }
 
     async fn set_volume(&self, volume: u32) -> Result<(), CastError> {
         self.controller
             .set_volume(&self.device, volume.clamp(0, 100))
             .await
-            .map_err(e)
+            .map_err(|error| self.failure("设置音量", error))
     }
 
     async fn get_volume(&self) -> Result<Option<u32>, CastError> {
@@ -242,7 +250,7 @@ impl Caster for DlnaCaster {
             .get_volume(&self.device)
             .await
             .map(Some)
-            .map_err(e)
+            .map_err(|error| self.failure("查询音量", error))
     }
 
     async fn set_quality(&self, quality: Quality) -> Result<(), CastError> {

@@ -41,6 +41,7 @@ tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
 ] }
 
 rupnp = "3.0.0"
+roxmltree = "0.20"
 serde = "1.0.228"
 serde_json = "1.0.149"
 mp4 = "0.14.0"

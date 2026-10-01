@@ -74,7 +74,7 @@ async fn control_requests_retry_only_timeouts_before_response_headers() {
             .build()
             .unwrap();
         let result = async {
-            retry_cast_request(|| client.post(&url).send())
+            retry_cast_request("test request", || client.post(&url).send())
                 .await?
                 .error_for_status()?
                 .json::<serde_json::Value>()
@@ -99,7 +99,7 @@ async fn connection_refused_is_not_retried() {
     drop(listener);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let calls = AtomicUsize::new(0);
-    let error = retry_cast_request(|| {
+    let error = retry_cast_request("test request", || {
         calls.fetch_add(1, Ordering::SeqCst);
         client.post(&url).send()
     })

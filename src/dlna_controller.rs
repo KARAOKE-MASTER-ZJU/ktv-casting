@@ -174,6 +174,33 @@ fn parse_soap_response_fields(text: &str) -> HashMap<String, String> {
     out
 }
 
+fn soap_http_failure(status: reqwest::StatusCode, text: &str) -> String {
+    let mut summary = format!("HTTP={}", status.as_u16());
+    if let Ok(document) = roxmltree::Document::parse(text) {
+        if let Some(fault) = document.descendants().find(|node| node.has_tag_name("Fault")) {
+            let field = |name| fault.descendants()
+                .find(|node| node.has_tag_name(name))
+                .and_then(|node| node.text())
+                .map(str::trim);
+            let code = field("errorCode").unwrap_or("未知");
+            let description = field("errorDescription")
+                .or_else(|| field("faultstring"))
+                .unwrap_or("未提供说明");
+            summary.push_str(&format!("，SOAP错误={} {}", code, description));
+        }
+    }
+    if text.trim().is_empty() {
+        summary.push_str("，响应体为空");
+    }
+    summary
+}
+
+fn soap_request_failure(action: &str, url: &str, stage: &str, detail: impl std::fmt::Display) -> rupnp::Error {
+    let message = format!("[DLNA] {}失败：步骤={}，端点={}，{}", action, stage, url, detail);
+    log::warn!("{}", message);
+    rupnp::Error::invalid_response(std::io::Error::other(message))
+}
+
 /// 用全局共享 client（连接池复用 + 统一超时）发送一次 SOAP 请求到指定 URL。
 /// 这是主要 SOAP 通道：避免 rupnp 原生 action 每次新建 TCP 连接、每秒打一次设备，
 /// 长时间运行把设备 UPnP 服务打崩。
@@ -211,13 +238,23 @@ async fn send_soap_shared(
             .await
     };
     let resp = if retry_timeout {
-        crate::cast::retry_cast_request(send).await
+        let context = format!("[DLNA] 发送 {}：端点={}", action, final_url);
+        crate::cast::retry_cast_request(&context, send).await
     } else {
         send().await
     }
-    .map_err(rupnp::Error::invalid_response)?;
+    .map_err(|error| {
+        let detail = if error.is_timeout() {
+            "等待响应头超时".to_owned()
+        } else {
+            error.to_string()
+        };
+        soap_request_failure(action, final_url, "发送SOAP请求", detail)
+    })?;
     let status = resp.status();
-    let text = resp.text().await.map_err(rupnp::Error::invalid_response)?;
+    let text = resp.text().await.map_err(|error| {
+        soap_request_failure(action, final_url, "读取SOAP响应", format!("HTTP={}，错误={}", status.as_u16(), error))
+    })?;
 
     if status.as_u16() == 200 {
         // GetPositionInfo is polled roughly once per second by the app. A successful
@@ -231,13 +268,9 @@ async fn send_soap_shared(
         log::debug!("UPnP Action (shared) status=200 body={}", text);
         Ok(parse_soap_response_fields(&text))
     } else {
-        log::warn!(
-            "UPnP Action (shared) failed with url {}: status={} body={}",
-            final_url,
-            status,
-            text
-        );
-        Err(rupnp::Error::HttpErrorCode(status))
+        let message = format!("[DLNA] {}失败：步骤=设备响应，端点={}，{}", action, final_url, soap_http_failure(status, &text));
+        log::warn!("{}，响应体={}", message, text);
+        Err(rupnp::Error::invalid_response(std::io::Error::other(message)))
     }
 }
 
@@ -271,6 +304,8 @@ async fn avtransport_action_compat(
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
     let service_debug = format!("{:?}", service);
+    let mut first_failure = None;
+    let mut primary_endpoint = None;
 
     // 1) 首选：Debug 提取 control endpoint，走共享 client（连接复用，避免每秒新建连接打崩设备）
     if let Some(path) = extract_control_endpoint_from_debug(&service_debug) {
@@ -280,8 +315,13 @@ async fn avtransport_action_compat(
         } else {
             format!("{}://{}:{}{}", scheme, host, port, p)
         };
-        if let Ok(response) = send_soap_shared(&final_url, action, args_xml, crate::SOAP_TIMEOUT, retry_timeout).await {
-            return Ok(response);
+        primary_endpoint = Some(final_url.clone());
+        match send_soap_shared(&final_url, action, args_xml, crate::SOAP_TIMEOUT, retry_timeout).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                first_failure = Some(error.to_string());
+                log::debug!("[DLNA] {}首选端点失败，回退至原生接口：端点={}", action, final_url);
+            }
         }
     }
 
@@ -293,10 +333,10 @@ async fn avtransport_action_compat(
             return Ok(response);
         }
         Err(e) => {
-            log::warn!(
-                "UPnP Action (native) failed: {}, trying common control paths",
-                e
-            );
+            let endpoint = primary_endpoint.unwrap_or_else(|| base_url.to_string());
+            let message = format!("[DLNA] {}原生接口失败：端点={}，错误={}，继续尝试候选路径", action, endpoint, e);
+            log::warn!("{}", message);
+            first_failure.get_or_insert(message);
         }
     }
 
@@ -333,15 +373,17 @@ async fn avtransport_action_compat(
         match send_soap_shared(&final_url, action, args_xml, SOAP_TIMEOUT_COMPAT, retry_timeout).await {
             Ok(response) => return Ok(response),
             Err(e) => {
-                log::warn!("UPnP Action (compat) failed with path {}: {}", final_url, e);
+                first_failure.get_or_insert_with(|| e.to_string());
+                log::debug!("[DLNA] {}回退候选失败：端点={}，错误={}", action, final_url, e);
             }
         }
     }
 
     // 所有尝试都失败
-    Err(rupnp::Error::ParseError(Box::leak(
-        "所有AVTransport操作尝试都失败".to_string().into_boxed_str(),
-    )))
+    let message = format!("[DLNA] {}失败：所有控制端点均失败；首个失败原因={}",
+        action, first_failure.as_deref().unwrap_or("没有可用控制端点"));
+    log::warn!("{}", message);
+    Err(rupnp::Error::invalid_response(std::io::Error::other(message)))
 }
 
 fn normalize_control_path(path: &str) -> String {
@@ -916,6 +958,10 @@ impl DlnaController {
         Ok(volume)
     }
 }
+#[cfg(test)]
+#[path = "../test/cast_diagnostics.rs"]
+mod diagnostics_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

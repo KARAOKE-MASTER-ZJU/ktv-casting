@@ -476,7 +476,7 @@ async fn play_and_confirm(
             )
         }
         Err(error) => {
-            warn!("投屏失败: {}", error);
+            warn!("投屏失败：曲目={}，错误={}", song, error);
             false
         }
     }

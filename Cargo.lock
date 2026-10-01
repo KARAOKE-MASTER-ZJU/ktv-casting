@@ -1621,6 +1621,7 @@ dependencies = [
  "mp4",
  "qr2term",
  "reqwest",
+ "roxmltree",
  "rquickjs",
  "rupnp",
  "rustls",

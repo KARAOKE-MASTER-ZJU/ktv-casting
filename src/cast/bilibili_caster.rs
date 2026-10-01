@@ -372,7 +372,11 @@ impl BilibiliCaster {
 
         let extra_str = full_extra.to_string();
 
-        log::info!("[Bilibili] send_cmd: command={}, oid={}, cid={:?}, extra={}", command, oid, cid_str, extra_str);
+        let mut logged_extra = full_extra.clone();
+        if let Some(extra) = logged_extra.as_object_mut() {
+            extra.remove("accessKey");
+        }
+        log::info!("[Bilibili] send_cmd: command={}, oid={}, cid={:?}, extra={}", command, oid, cid_str, logged_extra);
 
         // 构建form参数，cid作为顶级参数（如果存在）
         let mut params = vec![
@@ -398,36 +402,66 @@ impl BilibiliCaster {
 
         let body = form_body(&params);
 
+        let endpoint = format!("{}/x/tv/stream/cmd", API_HOST);
+        let context = format!("[Bilibili] {}：command={}，设备={}，端点={}", command_name(command), command, self.device_buvid, endpoint);
         let send = || async {
             bili_client()
-                .post(format!("{}/x/tv/stream/cmd", API_HOST))
+                .post(&endpoint)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(body.clone())
                 .send()
                 .await
         };
         let response = if command == 1 {
-            super::retry_cast_request(send).await
+            super::retry_cast_request(&context, send).await
         } else {
             send().await
         }
-        .map_err(|e| CastError::Device(e.to_string()))?;
-        let resp: Value = response
-            .json()
-            .await
-            .map_err(|e| CastError::Device(e.to_string()))?;
-
-        log::info!("[Bilibili] send_cmd response: command={}, code={}, message={}", command, resp["code"], resp["message"]);
-
-        if resp["code"].as_i64() != Some(0) {
-            Err(CastError::Device(format!(
-                "cmd {} failed: {} {}",
-                command, resp["code"], resp["message"]
-            )))
-        } else {
-            Ok(())
-        }
+        .map_err(|error| control_failure(&context, "发送请求", None, error))?;
+        read_control_response(&context, command, response).await
     }
+}
+
+async fn read_control_response(context: &str, command: u32, response: reqwest::Response) -> Result<(), CastError> {
+    let status = response.status();
+    let bytes = response.bytes().await
+        .map_err(|error| control_failure(context, "读取响应", Some(status), error))?;
+    let resp: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| control_failure(context, "解析JSON响应", Some(status), error))?;
+    let message = resp["message"].as_str()
+        .or_else(|| resp["msg"].as_str())
+        .unwrap_or("未提供说明");
+
+    log::info!("[Bilibili] send_cmd response: command={}, code={}, message={}", command, resp["code"], message);
+    if resp["code"].as_i64() != Some(0) {
+        Err(control_failure(context, "接口业务响应", Some(status), format!(
+            "业务错误={}，说明={}", resp["code"], message
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn command_name(command: u32) -> &'static str {
+    match command {
+        1 => "播放歌曲",
+        4 => "定位",
+        5 => "暂停",
+        6 => "继续播放",
+        7 => "停止播放",
+        8 => "调高音量",
+        9 => "设置弹幕",
+        10 => "设置清晰度",
+        12 => "调低音量",
+        _ => "控制指令",
+    }
+}
+
+fn control_failure(context: &str, stage: &str, status: Option<reqwest::StatusCode>, error: impl std::fmt::Display) -> CastError {
+    let http = status.map(|status| format!("，HTTP={}", status.as_u16())).unwrap_or_default();
+    let message = format!("{}失败：步骤={}{}，错误={}", context, stage, http, error);
+    log::warn!("{}", message);
+    CastError::Device(message)
 }
 
 fn parse_song_ref(s: &str) -> (String, u32) {
@@ -450,9 +484,10 @@ impl Caster for BilibiliCaster {
         let aid = bv_to_aid(&bvid);
         log::debug!("[Bilibili] BV to AID: {} -> {}", bvid, aid);
 
-        let (cid, duration) = get_page_info(&bvid, page).await.map_err(|e| {
-            log::error!("[Bilibili] get_page_info 失败: {}, bvid={}, page={}", e, bvid, page);
-            CastError::Device(e)
+        let (cid, duration) = get_page_info(&bvid, page).await.map_err(|error| {
+            let message = format!("[Bilibili] 获取曲目信息失败：BV={}，page={}，错误={}", bvid, page, error);
+            log::error!("{}", message);
+            CastError::Device(message)
         })?;
         log::info!("[Bilibili] get_page_info: page={} -> cid={}, duration={}", page, cid, duration);
 
@@ -559,7 +594,7 @@ impl Caster for BilibiliCaster {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_devices_response, remove_session_file};
+    use super::{parse_devices_response, read_control_response, remove_session_file};
     use serde_json::json;
     use std::path::Path;
 
@@ -579,5 +614,33 @@ mod tests {
 
         assert!(err.starts_with("auth expired:"));
         assert!(err.contains("账号未登录"));
+    }
+
+    #[tokio::test]
+    async fn control_errors_preserve_stage_http_status_and_business_message() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body, declared_length, expected) in [
+            (200, r#"{"code":-101,"message":"账号未登录"}"#, None, "步骤=接口业务响应，HTTP=200，错误=业务错误=-101，说明=账号未登录"),
+            (500, r#"{"code":-400,"msg":"参数错误"}"#, None, "步骤=接口业务响应，HTTP=500，错误=业务错误=-400，说明=参数错误"),
+            (502, "bad gateway", None, "步骤=解析JSON响应，HTTP=502"),
+            (200, "{", Some(100), "步骤=读取响应，HTTP=200"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/x/tv/stream/cmd", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).await.unwrap();
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", declared_length.unwrap_or(body.len()));
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let context = format!("[Bilibili] 播放歌曲：command=1，设备=test-device，端点={endpoint}");
+            let response = reqwest::Client::builder().no_proxy().build().unwrap()
+                .post(&endpoint).send().await.unwrap();
+            let error = read_control_response(&context, 1, response).await.unwrap_err().to_string();
+            server.await.unwrap();
+            assert!(error.contains(&context), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }
