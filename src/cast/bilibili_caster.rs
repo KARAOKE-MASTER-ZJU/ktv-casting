@@ -398,13 +398,21 @@ impl BilibiliCaster {
 
         let body = form_body(&params);
 
-        let resp: Value = bili_client()
-            .post(format!("{}/x/tv/stream/cmd", API_HOST))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| CastError::Device(e.to_string()))?
+        let send = || async {
+            bili_client()
+                .post(format!("{}/x/tv/stream/cmd", API_HOST))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .send()
+                .await
+        };
+        let response = if command == 1 {
+            super::retry_cast_request(send).await
+        } else {
+            send().await
+        }
+        .map_err(|e| CastError::Device(e.to_string()))?;
+        let resp: Value = response
             .json()
             .await
             .map_err(|e| CastError::Device(e.to_string()))?;

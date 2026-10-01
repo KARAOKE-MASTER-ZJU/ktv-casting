@@ -92,7 +92,7 @@ impl DlnaCaster {
         if session.as_ref().is_some_and(|s| s.is_stopped()) {
             return Err(CastError::Device("播放请求已过期".into()));
         }
-        self.controller.play(&self.device).await.map_err(e)?;
+        self.controller.play_for_cast(&self.device).await.map_err(e)?;
         if let Some(session) = &session {
             self.loaded_generation
                 .store(session.generation, std::sync::atomic::Ordering::Relaxed);

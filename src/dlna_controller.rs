@@ -182,6 +182,7 @@ async fn send_soap_shared(
     action: &str,
     args_xml: &str,
     timeout: Duration,
+    retry_timeout: bool,
 ) -> Result<HashMap<String, String>, rupnp::Error> {
     let soap_action_header =
         format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
@@ -200,19 +201,23 @@ async fn send_soap_shared(
         HeaderValue::from_static("text/xml; charset=\"utf-8\""),
     );
 
-    let resp = soap_client()
-        .post(final_url)
-        .timeout(timeout)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-        .map_err(rupnp::Error::invalid_response)?;
+    let send = || async {
+        soap_client()
+            .post(final_url)
+            .timeout(timeout)
+            .headers(headers.clone())
+            .body(body.clone())
+            .send()
+            .await
+    };
+    let resp = if retry_timeout {
+        crate::cast::retry_cast_request(send).await
+    } else {
+        send().await
+    }
+    .map_err(rupnp::Error::invalid_response)?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(rupnp::Error::invalid_response)?;
+    let text = resp.text().await.map_err(rupnp::Error::invalid_response)?;
 
     if status.as_u16() == 200 {
         // GetPositionInfo is polled roughly once per second by the app. A successful
@@ -252,6 +257,7 @@ async fn avtransport_action_compat(
     base_url: &Uri,
     action: &str,
     args_xml: &str,
+    retry_timeout: bool,
 ) -> Result<HashMap<String, String>, rupnp::Error> {
     let host = base_url
         .host()
@@ -274,7 +280,7 @@ async fn avtransport_action_compat(
         } else {
             format!("{}://{}:{}{}", scheme, host, port, p)
         };
-        if let Ok(response) = send_soap_shared(&final_url, action, args_xml, crate::SOAP_TIMEOUT).await {
+        if let Ok(response) = send_soap_shared(&final_url, action, args_xml, crate::SOAP_TIMEOUT, retry_timeout).await {
             return Ok(response);
         }
     }
@@ -324,7 +330,7 @@ async fn avtransport_action_compat(
         } else {
             format!("{}://{}:{}{}", scheme, host, port, path)
         };
-        match send_soap_shared(&final_url, action, args_xml, SOAP_TIMEOUT_COMPAT).await {
+        match send_soap_shared(&final_url, action, args_xml, SOAP_TIMEOUT_COMPAT, retry_timeout).await {
             Ok(response) => return Ok(response),
             Err(e) => {
                 log::warn!("UPnP Action (compat) failed with path {}: {}", final_url, e);
@@ -557,7 +563,7 @@ impl DlnaController {
         // 发送SOAP请求 - 统一使用设备描述文档URL(location)作为base url
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, &args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str, true).await?;
 
         log::debug!("SetAVTransportURI响应: {:?}", response);
 
@@ -593,7 +599,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, &args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str, false).await?;
 
         log::debug!("SetNextAVTransportURI响应: {:?}", response);
 
@@ -602,6 +608,14 @@ impl DlnaController {
 
     // 播放媒体
     pub async fn play(&self, device: &DlnaDevice) -> Result<(), rupnp::Error> {
+        self.play_impl(device, false).await
+    }
+
+    pub(crate) async fn play_for_cast(&self, device: &DlnaDevice) -> Result<(), rupnp::Error> {
+        self.play_impl(device, true).await
+    }
+
+    async fn play_impl(&self, device: &DlnaDevice, retry_timeout: bool) -> Result<(), rupnp::Error> {
         let avtransport = self
             .get_avtransport_service(device)
             .ok_or(rupnp::Error::ParseError("设备不支持AVTransport服务"))?;
@@ -612,7 +626,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str, retry_timeout).await?;
         log::debug!("Play响应: {:?}", response);
 
         Ok(())
@@ -630,7 +644,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str, false).await?;
         log::debug!("Pause响应: {:?}", response);
 
         Ok(())
@@ -648,7 +662,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str, false).await?;
         log::debug!("Stop响应: {:?}", response);
 
         Ok(())
@@ -665,7 +679,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str, false).await?;
         log::debug!("Next响应: {:?}", response);
 
         Ok(())
@@ -682,7 +696,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         log_upnp_action(avtransport, &base_url, action, args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str, false).await?;
         log::debug!("传输信息: {:?}", response);
 
         Ok(())
@@ -704,7 +718,7 @@ impl DlnaController {
         log_upnp_action(avtransport, &base_url, action, args_str);
 
         // 获取响应
-        let response = avtransport_action_compat(avtransport, &base_url, action, args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, args_str, false).await?;
 
         log::debug!("GetPositionInfo响应: {:?}", response);
 
@@ -801,7 +815,7 @@ impl DlnaController {
         log_upnp_action(avtransport, &base_url, action, &args_str);
 
         // 发送请求
-        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str, false).await?;
         log::info!("Seek响应: {:?}", response);
 
         Ok(())
