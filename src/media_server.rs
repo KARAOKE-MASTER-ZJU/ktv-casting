@@ -14,6 +14,7 @@ pub async fn proxy_handler(
     shared_state: web::Data<SharedState>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (mut origin_url,) = path.into_inner();
+    let mut duration_cache_key = None;
     // Session paths are immutable. Reject obsolete generations before resolving
     // Bilibili URLs or allocating any cache; an old renderer retry cannot switch
     // the current song back to an earlier one.
@@ -35,7 +36,11 @@ pub async fn proxy_handler(
             crate::media_session::SessionMedia::Seekable { mp4, cache } => {
                 return Ok(crate::virtual_mp4_http::serve(&req, mp4.clone(), cache.clone(), session.generation));
             }
-            crate::media_session::SessionMedia::Direct(url) => origin_url = url.clone(),
+            crate::media_session::SessionMedia::Direct(url) => {
+                // Progress reads durations by playlist song, including its page suffix.
+                duration_cache_key = Some(session.song.clone());
+                origin_url = url.clone();
+            }
         }
     }
     let query_string = req.query_string();
@@ -228,7 +233,7 @@ pub async fn proxy_handler(
 
     if !is_hls && !is_segment {
         let duration_cache = shared_state.duration_cache.clone();
-        let origin_url_clone = origin_url.clone();
+        let origin_url_clone = duration_cache_key.unwrap_or_else(|| origin_url.clone());
         let target_url_clone = target_url.clone();
         tokio::spawn(async move {
             // 先检查缓存中是否已有该视频的时长，若无则先用 0 占位，防止并发产生大量多余下载请求
